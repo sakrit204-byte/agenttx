@@ -518,7 +518,7 @@ for f in keep.txt new.txt delete_me.txt sub/old.txt sub/deeper/x.txt; do
   else printf '%s = <absent>\n' "$f"; fi
 done
 echo '===KMSG==='
-dmesg | grep agenttx | tail -14
+dmesg | grep agenttx | tail -14   # a TAIL, and the panel says so
 echo '===DONE==='
 """
     rc, so, se = GUEST._run_stdin(script)

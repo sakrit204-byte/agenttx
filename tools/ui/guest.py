@@ -113,6 +113,8 @@ for d in /var/lib/agenttx/tx-*; do
   L=$(readlink "$d/lower" 2>/dev/null) || continue
   [ -d "$L" ] || continue
   id=${d##*/tx-}
+  n=$(find "$L" -mindepth 1 2>/dev/null | wc -l)
+  [ "$n" -gt 60 ] && echo "$id TRUNCATED $n"
   find "$L" -mindepth 1 2>/dev/null | head -60 | while read -r f; do
     rel=${f#"$L/"}
     [ -d "$f" ] && k=dir || k=file
@@ -183,10 +185,16 @@ echo "---END---"
             if len(f) >= 2:
                 out["txdirs"].append({"tx": f[0], "upper_entries": int(f[1]),
                                       "lower": f[2] if len(f) > 2 else "-"})
+        # A listing capped at 60 entries must SAY it was capped. Silently
+        # showing 60 of 200 files is the dashboard telling a confident lie,
+        # which is the one thing every panel here is written not to do.
+        out["truncated"] = {}
         for key in ("UPPER", "LOWER"):
             for l in sec.get(key, []):
                 f = l.split(None, 2)
-                if len(f) == 3:
+                if len(f) == 3 and f[1] == "TRUNCATED":
+                    out["truncated"][f"{key.lower()}:{f[0]}"] = int(f[2])
+                elif len(f) == 3:
                     out[key.lower()].append({"tx": f[0], "kind": f[1], "path": f[2]})
 
         try:

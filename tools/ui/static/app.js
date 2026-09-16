@@ -729,6 +729,17 @@ async function refreshSystem() {
          d.health ? 'var(--irr)' : 'var(--rev)') +
     '</div>';
 
+  // Surface any truncation the guest reported.
+  const tr = d.truncated || {};
+  if (Object.keys(tr).length) {
+    const el2 = $('sysstrip');
+    el2.insertAdjacentHTML('beforeend',
+      `<p class="note bad" style="padding:8px 13px;margin:0">` +
+      Object.entries(tr).map(([k, n]) =>
+        `listing for ${esc(k)} truncated at 60 of ${n} entries`).join('; ') +
+      ` — the CoW panel is showing a sample, not the whole tree.</p>`);
+  }
+
   if (d.dmesg && d.dmesg.length) {
     const tb = $('kmsg');
     if (tb && tb.childElementCount === 0) {
