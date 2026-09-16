@@ -1,0 +1,686 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.75in]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+
+\newcommand{\sys}{AgentTx}
+\newcommand{\todo}[1]{\textcolor{red}{[\textbf{TODO:} #1]}}
+
+\title{\vspace{-1.5em}\textbf{Beyond Compensation: Kernel-Level Deferral of\\
+Irreversible Effects for Autonomous AI Agents}\\[0.3em]
+\large The \sys{} Project Proposal}
+
+\author{
+  \textit{Author One} \and \textit{Author Two} \and
+  \textit{Author Three} \and \textit{Author Four}\\[0.3em]
+  \small Department of Computer Science and Engineering\\
+  \small \todo{Institution} \quad \todo{Course code, B.Tech.\ Year III}
+}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Filesystem damage caused by autonomous coding agents is a solved problem.
+Production agents checkpoint every file-modifying action and restore on demand,
+and execute inside Landlock, seccomp and Seatbelt sandboxes by default. What
+remains unsolved --- and is publicly conceded as \emph{unsolvable} --- is the
+outbound effect: the push, the webhook, the email, the payment. Once a third
+party has observed an action, the prevailing view holds, no mechanism can take
+it back.
+
+That view is correct but stated at the wrong boundary. Irreversibility begins at
+\emph{observation}, not at the system call. Every deployed remedy ---
+compensating transactions, sagas, idempotency keys --- operates downstream of
+emission and is therefore best-effort by construction. Between the agent's
+\texttt{sendmsg} and the packet leaving the machine lies a region nobody
+occupies: the kernel.
+
+We propose \sys{}, which relocates the commit point into that region. Writes
+divert into a copy-on-write layer and outbound effects are captured in a kernel
+write-ahead log rather than emitted; commit applies both, abort discards both.
+For fire-and-forget effects this converts best-effort compensation into a hard
+guarantee. We do not reverse observation --- we prevent it.
+
+The mechanism, however, is only as meaningful as the policy governing it, and
+the governing question is \emph{what constitutes a transaction for an agent}.
+Too short and the guarantee window is negligible; too long and the system holds
+an unbounded write-ahead log across an unbounded number of agent decisions,
+a regime the transactional-memory literature was never designed for. We argue
+for \emph{verification-delimited} transactions: a transaction spans the interval
+over which no evidence about the agent's work is available, and commits the
+moment evidence arrives.
+
+\sys{} contributes (i) kernel-level deferral of fire-and-forget external
+effects; (ii) verification-delimited transaction boundaries, with the
+guarantee-window against staleness trade-off measured rather than asserted;
+(iii) an \texttt{int8}-quantised classifier evaluated \emph{inside} an eBPF LSM
+hook; (iv) a four-class effect taxonomy grounded in the literature on
+irrevocability, with the first measured distribution of real agent traces across
+it; and (v) the first head-to-head evaluation of agent rollback mechanisms under
+a single workload and metric set.
+\end{abstract}
+
+% =====================================================================
+\section{Introduction}
+
+A prompt injection is planted in the documentation of a widely used dependency.
+An agent reads it in the course of an ordinary task, and --- acting with the
+user's full authority --- reads the user's SSH private key and POSTs it to an
+external host. The POST is fire-and-forget: the agent does not require the
+response in order to continue.
+
+Under every deployed protection this either succeeds, because the destination
+allowlist happened to permit the host, or because the approval prompt displayed
+a shell command whose system-call trace the user could not have predicted; or it
+is blocked by a static rule that somebody wrote in advance having anticipated
+this specific exfiltration path. Neither is a guarantee.
+
+From the kernel's perspective the agent is an ordinary process running under the
+user's UID. From the user's perspective it is a process whose behaviour is
+partly determined by text it read moments earlier --- a confused deputy that is
+non-deterministic and ingests attacker-influenced input as a matter of routine
+operation.
+
+\subsection{What is already solved}
+
+We concede a great deal at the outset, because the value of this proposal
+depends on being precise about what remains.
+
+\paragraph{Sandboxing is commodity.} Codex CLI executes commands inside
+bubblewrap with unprivileged user namespaces, Landlock LSM filesystem filtering
+and seccomp-BPF syscall restriction on Linux, Seatbelt on macOS, and restricted
+tokens with synthetic SIDs on Windows~\cite{codexsandbox}. Anthropic has
+open-sourced the isolation layer behind Claude Code's sandbox
+tooling~\cite{sandboxescapes}.
+
+\paragraph{Filesystem rollback is commodity.} Claude Code records a checkpoint
+of affected files before every filesystem-modifying action and exposes a rewind
+operation restoring any prior point in a session~\cite{ccrewind}. The research
+literature has converged on the same capability~\cite{ftsandbox2025,
+deltabox2026}.
+
+\paragraph{Preventive egress control ships today.} Codex applies default-deny
+egress with destination allowlists, performing DNS and IP classification before
+permitting a hostname~\cite{codexsandbox}. ChatGPT Work exposes plan approval,
+configurable check-ins and per-action approval
+gates~\cite{chatgptwork,agentapprovals}.
+
+\subsection{What is not solved}
+
+Practitioners now describe agent reversibility in three tiers: the filesystem,
+cheaply reversible through checkpoints and worktrees; the database, reversible
+only through explicitly coded compensating transactions; and external side
+effects --- a sent email, a captured payment, a delivered webhook --- described
+as \emph{actions no mechanism can take back once a third party has seen
+them}~\cite{rollbackpatterns2026}.
+
+That third tier is a stated impossibility claim, and on its own terms it is
+true. Observation transfers information, and no operation removes information
+from a party one does not control. A refund is not an un-charge; it is a second
+effect that happens to net to zero. Two-phase commit works only because
+participants agree in advance to prepare; a third party who never joined the
+protocol offers no lever. Speculator~\cite{nightingale2005speculator} and
+Xsyncfs~\cite{nightingale2006xsyncfs} met this wall two decades ago with
+considerable kernel machinery and drew the same line: they buffered output until
+it was safe, and never claimed to un-output.
+
+\subsection{The observation}
+
+The claim conflates two distinct events.
+
+\begin{center}
+\small
+\begin{tabular}{@{}cl@{}}
+\multicolumn{2}{@{}l}{\texttt{agent calls sendmsg()}}\\
+$\downarrow$ & \\
+\textbf{1.\ Emission} & the packet leaves the machine\\
+$\downarrow$ & \textit{$\leftarrow$ true irreversibility boundary}\\
+\textbf{2.\ Observation} & a third party reads and acts\\
+\end{tabular}
+\end{center}
+
+Compensating transactions, sagas and idempotency keys all begin downstream of
+emission, and are best-effort by construction because they operate where the
+impossibility genuinely binds. The interval between the system call and emission
+--- wholly inside the kernel --- is unoccupied, and is the only place a
+\emph{guarantee} rather than a best effort is available.
+
+We note that this differs from idempotency keys in kind, not merely in degree:
+an idempotency key requires the \emph{receiver} to implement it, whereas
+deferral requires nothing of the receiver at all.
+
+\subsection{Scope: what the mechanism does not reach}
+\label{sec:scope}
+
+Not every agent incident is within reach, and we state the boundary early
+because a motivating example that the mechanism does not address is worse than
+no example. In 2026 an agent deleted a production database and its backups in
+nine seconds~\cite{cursorincident}. \sys{}'s \emph{classifier} would not have
+caught it: each individual operation was routine, and per-call classification is
+by construction a local decision. \sys{}'s \emph{deferral} would not have held
+it either, since a remote database mutation is a request--response exchange in
+which the agent blocks on the reply (\S\ref{sec:reqresp}).
+
+What \sys{} offers in that scenario is the \emph{transaction}: a destructive
+sequence staged under a verification-delimited boundary whose commit gate is
+``the test suite still passes'' never commits, regardless of how routine each
+step appeared. Mechanism and motivating example must be matched, and we
+distinguish throughout which of our contributions addresses which failure.
+
+\subsection{Contributions}
+
+\begin{enumerate}\itemsep2pt
+\item \textbf{Kernel-level deferral of fire-and-forget external effects.}
+      Outbound operations issued inside a transaction are captured in a kernel
+      write-ahead log and released only on commit. For this class, abort
+      provides a hard guarantee where the state of the art provides best-effort
+      compensation.
+\item \textbf{Verification-delimited transaction boundaries.} We argue that the
+      boundary question is the governing design decision, propose an answer
+      derived from when evidence becomes available, and measure the resulting
+      trade-off between guarantee window, snapshot staleness and log growth
+      (\S\ref{sec:policy}).
+\item \textbf{In-kernel effect classification.} An \texttt{int8}-quantised
+      classifier executes with integer arithmetic inside an eBPF LSM hook,
+      removing the per-call context switch that makes \texttt{seccomp}
+      user-notify mediation too expensive to leave enabled.
+\item \textbf{A four-class effect taxonomy}, grounded in the irrevocable
+      transaction literature, with the first measured distribution of real agent
+      system-call traces across it.
+\item \textbf{A comparative evaluation} of agent rollback mechanisms under one
+      workload and one metric set.
+\end{enumerate}
+
+\subsection{What we do not claim}
+\label{sec:nonclaims}
+
+We do not claim the transaction abstraction, which is
+TxOS~\cite{porter2009txos}; output buffering, which is
+Xsyncfs~\cite{nightingale2006xsyncfs}; fixed-point inference under the eBPF
+verifier, which is established
+practice~\cite{ebpffixedpoint2024,kernelpacketml2024,akgun2023kml}; filesystem
+rollback for agents, which ships in production and appears in concurrent
+work~\cite{ccrewind,ftsandbox2025,deltabox2026}; or the ability to reverse
+observed effects, which is impossible.
+
+We further decline to claim automatic inference of compensation windows
+(\S\ref{sec:compensable}), which we believe the kernel cannot obtain and which
+we name as an open problem rather than a contribution.
+
+% =====================================================================
+\section{Background and Related Work}
+\label{sec:related}
+
+\subsection{Operating system transactions}
+
+TxOS~\cite{porter2009txos} added \texttt{sys\_xbegin}, \texttt{sys\_xend} and
+\texttt{sys\_xabort} to Linux 2.6.22, providing ACID semantics for OS resources
+using lazy version management over shadow copies of kernel objects. It cost
+3{,}300 lines for transaction management and 5{,}300 for object management, plus
+roughly 14{,}000 lines of changes to existing kernel code; a transactional
+OpenSSH installation incurred 10\% overhead. It was never merged.
+
+Its coverage is the relevant fact for us. TxOS provided transactional semantics
+for \textbf{150 of 303 Linux system calls}, with 153 explicitly unsupported
+(\cite[Table~1]{porter2009txos}). \texttt{socket} is among the unsupported
+communication calls, alongside \texttt{ipc}, \texttt{mq\_open} and
+\texttt{mq\_unlink}; the authors note that ``extending transactions to include
+networking (a real challenge) would increase the count of supported calls by
+5.'' On encountering an unsupported call, ``the system logs a warning or aborts
+the transaction, depending on the flags passed to \texttt{sys\_xbegin()}''
+(\cite[\S3.2]{porter2009txos}). There is no irrevocable-transaction mechanism:
+un-undoable work is handled by exclusion, then by warning or abort --- never by
+committing early under a no-abort guarantee. Nor does TxOS restore application
+state on abort, only kernel state (\cite[\S3.1.4]{porter2009txos}).
+
+Most directly relevant, TxOS anticipated our central limit. Its \S3.1.5
+observes that ``code that communicates outside of a transaction and requires a
+response cannot be encapsulated into a single system transaction,'' that ``the
+system might buffer the message until commit,'' and that a transaction awaiting
+a reply on the same channel will deadlock. Its resolution: ``\emph{the
+programmer is responsible} for avoiding this send/reply idiom within a
+transaction.''
+
+TxFS~\cite{hu2018txfs,hu2019txfs} subsequently showed that ACID filesystem
+transactions are obtainable in 5{,}200 lines by reusing the ext4 journal.
+
+\emph{Our position.} The abstraction is inherited, and so --- we discovered on
+reading it closely --- is the observation that request--response communication
+cannot be transactional and that outbound messages may be buffered until commit.
+What does not transfer is TxOS's resolution. \textbf{In the agent setting there
+is no programmer} to be held responsible: the sequence of system calls is
+generated at run time, non-deterministically, by a process under adversarial
+influence. An escape hatch that reads as reasonable engineering advice in 2009
+is precisely the assumption that fails in 2026. Our contribution is therefore
+not the idea of buffering but its enforcement without a cooperating programmer:
+classification of which effects may be buffered, at the network layer TxOS
+excluded, with commit authority removed from the party issuing the calls
+(\S\ref{sec:authority}).
+
+\subsection{Irrevocability: the correct frame}
+
+The problem of I/O inside a transaction is long-standing and named. The software
+transactional memory literature calls a transaction performing un-undoable work
+\emph{irrevocable} or \emph{inevitable}, and resolves it not by reversing the
+I/O but by guaranteeing in advance that the transaction will never abort,
+typically by serialising it so that it wins all
+conflicts~\cite{welc2008irrevocable,spear2008inevitability}.
+
+We adopt this frame, with one caveat we must confront rather than inherit: that
+literature assumes short-lived transactions bounded by a few thousand
+instructions. Agent transactions are bounded by human-scale activities lasting
+seconds to minutes, and the assumption does not transfer.
+\S\ref{sec:boundary} treats this as a first-class problem.
+
+\subsection{Speculation and external output}
+
+Speculator~\cite{nightingale2005speculator} provided kernel support for
+speculative execution, checkpointing processes and propagating causal
+dependencies through IPC. Xsyncfs~\cite{nightingale2006xsyncfs} developed
+\emph{external synchrony}: buffer externally observable output until the state
+it depends on is durable.
+
+\emph{Our position.} Our effect log is external synchrony with a different
+trigger --- we delay until the enclosing transaction commits rather than until
+state is durable --- applied to network sends rather than file output, in a
+setting where the emitting process is untrusted rather than merely impatient.
+That last difference is not cosmetic: it forces a threat model
+(\S\ref{sec:threat}) that neither prior system required.
+
+\subsection{Agent sandboxing, rollback and state}
+
+Concurrent work presents a transactional sandbox for coding agents combining
+policy interception with filesystem snapshots, reporting complete interception
+of high-risk commands and complete rollback at roughly 14.5\%
+overhead~\cite{ftsandbox2025}. DeltaBox~\cite{deltabox2026} achieves millisecond
+checkpoint and rollback through a change-based state abstraction.
+Cordon~\cite{cordon2026} places transactions at the tool-call boundary.
+AgentSight~\cite{agentsight2025} demonstrates eBPF observability at under 3\%
+overhead by correlating intercepted model traffic with kernel events --- a
+technique we adopt for payload inspection (\S\ref{sec:reqresp}).
+ACRFence~\cite{acrfence2026} studies attacks against agent checkpoint-restore
+itself. ChronoMem~\cite{chronomem2026} and MemTX~\cite{memtx2026} apply
+versioning and transactional commit to agent \emph{memory}, which we draw on in
+\S\ref{sec:coherence}. ActPlane~\cite{actplane} and CRAB~\cite{crab} are
+reported to perform in-kernel eBPF policy enforcement and effect classification
+respectively.
+\todo{Read \cite{actplane} and \cite{crab} in full before the design freeze. If
+either already defers external effects in-kernel, Contribution~1 collapses and
+the project repositions onto Contributions~2 and~5.}
+
+Orthogonally, CaMeL~\cite{debenedetti2025camel} defeats prompt injection by
+construction. \sys{} is complementary: CaMeL constrains what an agent decides;
+\sys{} constrains what its system calls can make real.
+
+\subsection{Machine learning inside the kernel}
+
+KML~\cite{akgun2023kml,akgun2021kmlarxiv} demonstrated in-kernel neural networks
+and decision trees in under 4\,KB of dynamic memory at below 0.2\% CPU overhead.
+Within eBPF the verifier forbids floating point; the established response is to
+train in user space, quantise to integer parameters, ship weights through BPF
+maps and execute layers via tail calls, with in-kernel inference roughly 84\%
+faster than the user-space
+equivalent~\cite{ebpffixedpoint2024,kernelpacketml2024,ebpfml2024}.
+
+% =====================================================================
+\section{Mechanism}
+\label{sec:design}
+
+\subsection{Interface}
+
+\begin{center}
+\texttt{tx\_begin(flags)}\quad\texttt{tx\_commit()}\quad\texttt{tx\_abort()}
+\end{center}
+
+\noindent During development these are \texttt{ioctl}s on a character device;
+the final implementation promotes them to system calls. Critically,
+\texttt{tx\_commit} is \emph{not} available to the transacting process
+(\S\ref{sec:authority}).
+
+\subsection{Isolation model}
+
+On \texttt{tx\_begin} the transaction manager mounts an overlay in a private
+mount namespace belonging to the transacting process: the working directory as
+read-only lower layer, a per-transaction staging directory as upper, merged at
+the original path and visible only inside that namespace.
+
+The agent observes an unchanged path and reads its own writes. Every other
+process --- the user's editor, shell and version control --- observes the
+unmodified directory, yielding snapshot isolation and ensuring an abort cannot
+invalidate an open editor buffer. Storage cost is proportional to the set of
+files written, not the size of the working directory; where the underlying
+filesystem supports cloning, copy-up may be satisfied by a reflink. We measure
+both cases.
+
+\subsection{The four-class taxonomy}
+
+eBPF LSM programs attach to \texttt{file\_open}, \texttt{inode\_unlink},
+\texttt{inode\_rename}, \texttt{socket\_connect}, \texttt{socket\_sendmsg} and
+\texttt{bprm\_check\_security}. Each intercepted operation is classified:
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.3cm}@{}}
+\toprule
+\textbf{Class} & \textbf{Handling}\\
+\midrule
+Reversible   & proceed; the CoW layer captures it\\
+Deferrable   & record in the effect WAL, report success, do not emit\\
+Compensable  & emit, record a cancellation window and commit deadline\\
+Irrevocable  & the transaction becomes non-abortable and terminates; escalate
+               to a human approval gate, deny on timeout\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Commit flushes the WAL in issue order and merges the upper layer down; abort
+discards both. A write to a terminal has already been observed by a human and is
+irrevocable by construction.
+
+\subsection{The compensable class: a registry, not an inference}
+\label{sec:compensable}
+
+Some destinations do cooperate: a payment may be voided before capture, a push
+force-reverted before anyone pulls, a resource deleted after creation. The
+kernel, however, has no application semantics with which to discover this. We
+considered and rejected inferring cancellation windows from traffic; nothing
+observable at the LSM hook distinguishes an endpoint that honours a void from
+one that does not.
+
+We therefore specify the compensable class as a \emph{declarative registry},
+distributed and updated like a certificate bundle: a mapping from host and path
+pattern to a cancellation endpoint and a window duration. The kernel consults
+it; it does not learn it. A transaction that emits a compensable effect acquires
+a commit deadline equal to the shortest window it holds, and is aborted --- with
+compensation attempted --- if the deadline passes.
+
+This is deliberately modest. Automatic inference of compensation semantics is,
+we believe, not solvable at the kernel boundary, and we name it as an open
+problem rather than claim it (\S\ref{sec:nonclaims}).
+
+\subsection{The request--response limit}
+\label{sec:reqresp}
+
+Deferral is possible only where the agent does not block on a reply. A
+fire-and-forget effect --- a push, a webhook, a notification, a payment
+submission --- may be held; a request--response exchange such as an API query or
+package download may not, and a transaction that waits on a buffered channel
+deadlocks outright.
+
+This limit is not ours to discover: TxOS states it precisely in its \S3.1.5 and
+resolves it by assigning the programmer responsibility for avoiding the
+send/reply idiom inside a transaction. We inherit the limit and reject the
+resolution, because no programmer is present to be held responsible. The
+consequence is that what TxOS could leave as a documented caveat, we must detect
+and enforce at run time: an effect that would block must be recognised as such
+before it is buffered, or the agent deadlocks. Classification therefore does
+work in \sys{} that it did not have to do in TxOS.
+
+The magnitude of Contribution~1 is bounded by the fraction of agent outbound
+effects that are fire-and-forget, a quantity nobody has measured. We treat this
+as a first-class result and a project gate (\S\ref{sec:eval}).
+
+A second limit is visibility: at the syscall boundary a TLS \texttt{sendmsg}
+carries opaque bytes, so mutating and non-mutating operations to the same host
+are indistinguishable. We adopt AgentSight's approach~\cite{agentsight2025},
+attaching uprobes to the TLS library write path to recover plaintext. This is
+precisely where \sys{} improves on destination allowlists, which are static and
+per-host and cannot separate a read from a mutation against the same endpoint.
+
+\subsection{In-kernel classification}
+
+A small model is trained in user space on labelled agent traces, quantised to
+\texttt{int8} and loaded into a BPF map; the forward pass uses integer
+arithmetic and a fixed-point sigmoid lookup table with bounded iteration.
+Features are restricted to quantities cheaply computable in hook context:
+syscall number, hashed path prefix, descriptor type, destination port,
+transaction depth and a short call n-gram. The classifier is \emph{fail-closed}:
+an unknown or low-confidence result is treated as irrevocable and escalated,
+never silently permitted (\S\ref{sec:threat}).
+
+% =====================================================================
+\section{Policy}
+\label{sec:policy}
+
+A deferral mechanism is only as meaningful as the rule governing release. This
+section addresses the questions the mechanism alone leaves open.
+
+\subsection{What is a transaction?}
+\label{sec:boundary}
+
+Nothing in \S\ref{sec:design} says how long a transaction lasts, and the answer
+determines whether the guarantee is worth anything.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{4.1cm}@{}}
+\toprule
+\textbf{Boundary} & \textbf{Consequence}\\
+\midrule
+Per tool call & Guarantee window of milliseconds. Effects commit almost
+                immediately; protection is near-nil\\
+Per verification & Window equal to an edit--build--test cycle. Bounded
+                staleness, bounded log\\
+Per task or session & Large window, but unbounded log across an unbounded
+                number of agent decisions, and a snapshot arbitrarily stale\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The question is not new but has never been answered. TxOS raised it and
+deliberately left it open, observing that ``allowing a long running transaction
+to isolate all system resources indefinitely is undesirable, so the OS may want
+a policy that limits the size of a transaction,'' and comparing the matter to
+controlling any process that abuses system resources
+(\cite[\S3.1.3]{porter2009txos}). It supplied the mechanism and declined the
+policy. For a workload whose transactions are bounded by human-scale activity
+rather than by a critical section, the policy can no longer be deferred.
+
+We argue for the middle option on principle rather than convenience. The reason
+to speculate at all is that safety cannot be decided in advance; the moment
+evidence \emph{does} arrive --- the build succeeds, the test suite passes, a
+human reviews the diff --- the decision should be taken. A transaction should
+therefore span exactly the interval over which no evidence is available. We call
+this a \emph{verification-delimited} transaction. Its length is determined by
+the workload rather than configured, and a session becomes a sequence of
+transactions rather than one long one.
+
+Two properties follow. First, the taxonomy and the boundary interlock: an
+irrevocable effect terminates the enclosing transaction, exactly as an
+irrevocable operation forces commitment in
+STM~\cite{welc2008irrevocable}. Second, because agent transactions are orders of
+magnitude longer than those the STM literature assumes, its results on
+serialising irrevocable transactions cannot be imported unmodified; we expect
+contention behaviour to differ and will report it.
+
+We do not assert that verification-delimited is optimal. We make transaction
+length an evaluation axis (\S\ref{sec:eval}) and report guarantee window,
+staleness-induced conflict rate and log growth at each of the three boundaries.
+
+\subsection{Who may commit}
+\label{sec:authority}
+
+The agent is the untrusted party. It must therefore not hold commit authority:
+\texttt{tx\_commit} invoked by a process inside the transaction returns
+\texttt{-EPERM}. Commit is exercised only by the supervising process, which is
+outside the transaction and is driven by the verification signal, a policy rule,
+or a human.
+
+This single invariant eliminates the most obvious attack on the system --- a
+prompt-injected agent instructed to commit before its exfiltration is
+inspected --- and it is why \texttt{tx\_begin} and \texttt{tx\_commit} are
+asymmetric in a way TxOS's interface was not.
+
+\subsection{Coherence of agent reasoning}
+\label{sec:coherence}
+
+Reporting success for a deferred send makes the agent's subsequent reasoning
+conditional on an event that may never occur. If the transaction later aborts,
+the agent holds a chain of inferences built on a false premise.
+
+TxOS faced the analogous problem and left it to the caller: on abort ``the OS
+restores the kernel state to its pre-transaction state, but it does not revert
+application state'' (\cite[\S3.1.4]{porter2009txos}), offering an optional
+copy-on-write checkpoint of the application address space, in the manner of
+Speculator, as a flag to \texttt{sys\_xbegin}. For an agent this cannot be
+optional, and the address space is the wrong granularity in any case: the state
+that must be reverted is the conversation, which lives in the supervising
+harness rather than in the transacting process.
+
+We therefore place the agent's reasoning state \emph{inside} the transaction.
+Conversation and scratch state are owned by the supervising harness, staged in
+the same copy-on-write layer as the filesystem, and discarded on abort along
+with everything else. An abort therefore returns the agent to the
+epistemic position it occupied at \texttt{tx\_begin}, with no false premise
+surviving. This mirrors the versioned and transactional treatment of agent
+memory developed in~\cite{chronomem2026,memtx2026}, and it is the reason our
+transaction spans three kinds of state rather than two.
+
+We considered the alternative of returning an explicit \texttt{DEFERRED} status
+so the agent may reason about pending effects. It requires agent cooperation and
+a model that handles the concept correctly, and we regard it as future work.
+
+\subsection{Threat model}
+\label{sec:threat}
+
+The adversary is a prompt injection that fully controls the agent's outputs. It
+does not hold a kernel exploit, does not control the supervising harness, and
+does not run as root. Attacks on \sys{} itself and our responses:
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{2.6cm}p{4.6cm}@{}}
+\toprule
+\textbf{Attack} & \textbf{Response}\\
+\midrule
+Premature commit & Agent cannot commit (\S\ref{sec:authority})\\
+Escape the transaction by spawning outside the namespace &
+  Namespace is inherited across \texttt{fork}/\texttt{execve};
+  \texttt{unshare} and \texttt{setns} denied inside a transaction\\
+Adversarial evasion of the classifier &
+  Fail-closed: low confidence escalates rather than permits. Evasion yields a
+  prompt, not a silent pass\\
+WAL exhaustion (emit millions of effects to force a flush) &
+  Bounded log; overflow aborts the transaction rather than releasing it\\
+TOCTTOU between classification and emission &
+  Classification and disposition occur in the same hook invocation\\
+Bypass TLS uprobes via static linking or custom crypto &
+  Degrades to destination-only classification; an acknowledged coverage gap\\
+Escape via un-instrumented paths &
+  The general weakness of interception designs~\cite{sandboxescapes};
+  we enumerate covered hooks explicitly rather than claim completeness\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Out of scope: kernel exploits, a compromised supervisor, malicious agent
+binaries as opposed to injected agent \emph{instructions}, and timing side
+channels --- deferral itself perturbs observable timing, which we note but do
+not defend against.
+
+% =====================================================================
+\section{Implementation Plan}
+
+The system decomposes into four components with interfaces frozen in week two
+and one developer each. Every component ships a stub implementation on day one,
+so any developer can build and boot the complete system in isolation and no
+component is blocked on another's progress.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{2.4cm}@{}}
+\toprule
+& \textbf{Component} & \textbf{Kernel surface}\\
+\midrule
+P1 & Transaction core & syscall table,
+                        \texttt{task\_struct}, locking\\
+P2 & CoW storage & VFS, overlayfs, stackable FS\\
+P3 & Effect interception & BPF LSM, networking, ring buffers\\
+P4 & Policy, evaluation & verifier, quantisation, measurement\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Development proceeds in four independently demonstrable rungs: a loadable module
+with \texttt{ioctl} control and overlay-backed abort; LSM interception with a
+static rule table; replacement of that table by the in-kernel classifier; and
+promotion to real system calls. Should a rung prove intractable, the preceding
+rung remains a complete system. Multi-agent optimistic concurrency control is
+scoped as a stretch objective.
+
+% =====================================================================
+\section{Evaluation Plan}
+\label{sec:eval}
+
+\paragraph{Project gate.} In weeks three to four we instrument real agent
+sessions and measure the fraction of outbound network operations that are
+fire-and-forget rather than request--response. Above 20\%, Contribution~1 stands
+and the measurement becomes a headline figure. Below 10\%, we narrow the claim
+and promote Contributions~2 and~5. This costs four days and de-risks the
+remainder of the project.
+
+\paragraph{Boundary sweep.} We run the full workload at each of the three
+transaction boundaries of \S\ref{sec:boundary}, reporting guarantee window,
+staleness-induced conflict rate at commit, peak WAL size, and the fraction of
+transactions terminated early by an irrevocable effect. This converts the
+central design decision from an assertion into a measurement.
+
+\paragraph{Metrics.} Task success rate; containment rate under adversarial
+input; interception latency; end-to-end overhead; storage amplification;
+classifier accuracy before and after quantisation, and under adversarial
+perturbation; and the empirical distribution of agent effects across the
+taxonomy.
+
+\paragraph{Baselines.} Unprotected execution; session checkpoints as shipped in
+production agents~\cite{ccrewind}; \texttt{git} checkpoint and reset; container
+rebuild; microVM snapshot; static \texttt{seccomp} allowlist; user-space policy
+daemon via \texttt{seccomp} user-notify; and, where artifacts permit,
+\cite{ftsandbox2025} and \cite{deltabox2026}, whose published overheads of
+14.5\% and under 3\% are the figures we must meet or explain.
+
+\paragraph{Workloads.} A benign corpus of realistic development tasks; a
+fault-injection corpus of destructive actions; and an adversarial corpus in
+which prompt injections are planted in files the agent reads during ordinary
+operation, including the exfiltration scenario of \S1.
+
+\paragraph{Headline figures.} (1) The deferrable fraction of agent outbound
+effects. (2) Guarantee window against staleness across transaction boundaries.
+(3) In-kernel classification latency against accuracy.
+
+% =====================================================================
+\section{Limitations}
+
+Terminal output cannot be staged. Deferring a send means reporting success for
+an operation that has not occurred; \S\ref{sec:coherence} addresses the
+consequences for agent reasoning but not for a program that inspects the network
+result directly. Coverage is the weakest point of any interception design.
+Rollback mechanisms are themselves an attack surface~\cite{acrfence2026}. Our
+classifier is trained on traces from a specific set of agents and may not
+transfer. The compensable class depends on a registry somebody must maintain.
+And request--response effects, which may prove to be the majority, are outside
+the mechanism entirely.
+
+% =====================================================================
+\section{Conclusion}
+
+System transactions were proposed in 2009 and set aside for want of a workload
+justifying their cost. Autonomous agents supply that workload. Filesystem
+rollback for agents is now solved and we do not contest it; what remains is the
+class of effects the field has conceded as irreversible. We argue that class has
+been drawn too broadly, because irreversibility is a property of observation
+rather than of the system call, and that the kernel occupies the one interval in
+which a guarantee is still available. Equally, we argue that the mechanism is
+inert without an answer to what a transaction \emph{is} for an agent, and we
+propose to answer that question by measurement rather than assertion.
+
+\bibliographystyle{plain}
+\bibliography{refs}
+
+\end{document}

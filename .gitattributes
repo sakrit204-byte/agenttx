@@ -1,0 +1,21 @@
+# AgentTx is authored on Windows and built on Linux.
+# Every file the kernel build, the shell or the BPF loader touches MUST be LF.
+# A CRLF in a .sh is a "bad interpreter: /bin/bash^M" at 2am. Do not relax this.
+* text=auto eol=lf
+
+*.c    text eol=lf
+*.h    text eol=lf
+*.sh   text eol=lf
+*.py   text eol=lf
+*.mk   text eol=lf
+Makefile  text eol=lf
+Kbuild    text eol=lf
+*.csv  text eol=lf
+*.md   text eol=lf
+*.bt   text eol=lf
+*.patch text eol=lf
+
+*.pdf  binary
+*.png  binary
+*.img  binary
+*.bin  binary

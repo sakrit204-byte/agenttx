@@ -1,0 +1,158 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>AgentTx — harness</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="/static/app.css">
+
+<div class="wrap">
+
+<header>
+  <h1>AgentTx</h1>
+  <span class="sub">the kernel is where an agent's actions become real</span>
+  <div class="pills" id="pills"></div>
+</header>
+
+<!-- ================= THE MECHANISM ================= -->
+<div class="grid" style="margin-top:14px">
+  <div class="card">
+    <h2>the mechanism
+      <span class="src">every effect an agent emits travels this path</span></h2>
+    <div class="body tight">
+      <svg id="flow" viewBox="0 0 1180 400" preserveAspectRatio="xMidYMid meet"></svg>
+    </div>
+  </div>
+</div>
+
+<!-- ================= SYSTEM ================= -->
+<div class="grid">
+  <div class="card">
+    <h2>system <span class="src">live from the QEMU guest over ssh</span></h2>
+    <div class="body tight"><div id="sysstrip"></div></div>
+  </div>
+</div>
+
+<!-- ================= COW ================= -->
+<div class="grid">
+  <div class="card">
+    <h2>copy-on-write, watched happening
+      <span class="src">runs the real module in the guest — not an animation</span></h2>
+    <div class="body">
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px">
+        <button class="btn" id="demoAbort">run: writes then ABORT</button>
+        <button class="btn" id="demoCommit">run: writes then COMMIT</button>
+        <span class="note" id="demoStatus">pick one — each drives the real kernel</span>
+      </div>
+      <div id="cowbody"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= PROCESS MODEL ================= -->
+<div class="grid g2">
+  <div class="card">
+    <h2>who may commit <span class="src">src/core/ioctl.c · the premature-commit invariant</span></h2>
+    <div class="body"><div id="proctree"></div></div>
+  </div>
+  <div class="card">
+    <h2>verification progress <span class="src">tracker/*.csv</span></h2>
+    <div class="body tight"><div id="fragments"></div></div>
+  </div>
+</div>
+
+<!-- ================= LIVE ================= -->
+<div class="grid g2">
+  <div class="card">
+    <h2>intercepted effects <span class="src" id="effsrc">—</span></h2>
+    <div class="body tight">
+      <div class="scroll">
+        <table>
+          <thead><tr>
+            <th>#</th><th>hook</th><th>destination</th>
+            <th class="num">bytes</th><th>class</th><th class="num">conf</th><th>verdict</th>
+          </tr></thead>
+          <tbody id="effects"></tbody>
+        </table>
+      </div>
+      <div id="effempty" class="missing">no effects yet</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>transaction <span class="src">ioctl(TX_IOC_STAT) on /dev/agenttx</span></h2>
+    <div class="body">
+      <div id="txstate"></div>
+      <hr class="sep">
+      <h2 style="all:unset;font-size:10px;letter-spacing:.14em;color:var(--dim);
+                 text-transform:uppercase">kernel log</h2>
+      <div class="scroll" style="max-height:190px;margin-top:7px">
+        <table><tbody id="kmsg"></tbody></table>
+      </div>
+      <div id="kmsgempty" class="missing">nothing from the module yet</div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= THE GATE ================= -->
+<div class="grid">
+  <div class="card">
+    <h2>the project gate — fire-and-forget fraction
+      <span class="src">data/gate/*.jsonl · measured, not assumed</span></h2>
+    <div class="body" id="gate"></div>
+  </div>
+</div>
+
+<!-- ================= DEADLOCK ================= -->
+<div class="grid">
+  <div class="card">
+    <h2>concurrency &amp; deadlock
+      <span class="src">docs/deadlock.md · simulated semantics, not a kernel measurement</span></h2>
+    <div class="body">
+      <div id="dlctl" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;
+                             margin-bottom:12px"></div>
+      <div class="grid g2" style="gap:14px">
+        <div>
+          <svg id="wfg" viewBox="0 0 520 330" preserveAspectRatio="xMidYMid meet"
+               style="width:100%;height:auto;background:#0e141c;border:1px solid var(--line);
+                      border-radius:6px"></svg>
+          <div class="legend" style="margin-top:8px">
+            <span><b style="color:var(--def)">OUTPUT</b> waits on an uncommitted result</span>
+            <span><b style="color:var(--comp)">ESCALATE</b> asleep awaiting approval</span>
+            <span><b style="color:var(--dim)">DATA</b> commit-time conflict</span>
+          </div>
+        </div>
+        <div>
+          <div class="scroll" style="max-height:300px">
+            <table><tbody id="dlevents"></tbody></table>
+          </div>
+        </div>
+      </div>
+      <div id="dlverdict" style="margin-top:12px"></div>
+    </div>
+  </div>
+</div>
+
+<!-- ================= MODEL ================= -->
+<div class="grid g3">
+  <div class="card">
+    <h2>classifier <span class="src">data/model/report.json</span></h2>
+    <div class="body" id="train"></div>
+  </div>
+  <div class="card">
+    <h2>int8 quantisation <span class="src">quantize_report.json</span></h2>
+    <div class="body" id="quant"></div>
+  </div>
+  <div class="card">
+    <h2>the contract <span class="src">include/agenttx.h · parsed, not copied</span></h2>
+    <div class="body" id="contract"></div>
+  </div>
+</div>
+
+<p class="note" style="margin:18px 0 32px">
+  Panels name their source. A panel whose source is missing says so rather than
+  rendering a zero — a dashboard that cannot tell <em>“no effects”</em> from
+  <em>“not connected”</em> is the same failure <code>docs/STATUS.md</code> §6 is
+  about, drawn in colour.
+</p>
+
+</div>
+<script src="/static/app.js"></script>

@@ -1,0 +1,48 @@
+{"sim":true,"seq":1,"kind":"begin","tx":1,"agent":"agent-A","parent":null}
+{"sim":true,"seq":2,"kind":"begin","tx":2,"agent":"agent-B","parent":null}
+{"sim":true,"seq":3,"kind":"write","tx":1,"agent":"agent-A","path":"/repo/src/main.c","write_set":1}
+{"sim":true,"seq":4,"kind":"write","tx":2,"agent":"agent-B","path":"/repo/src/util.c","write_set":1}
+{"sim":true,"seq":5,"kind":"effect","tx":1,"agent":"agent-A","what":"write main.c","klass":0,"klass_name":"reversible","wal":1}
+{"sim":true,"seq":6,"kind":"effect","tx":2,"agent":"agent-B","what":"POST /webhook build-started","klass":1,"klass_name":"deferrable","wal":1}
+{"sim":true,"seq":7,"kind":"wait","tx":1,"agent":"agent-A","holder":2,"holder_agent":"agent-B","wait_kind":2,"wait_name":"OUTPUT","why":"A needs util.c, which B has not committed"}
+{"sim":true,"seq":8,"kind":"wait","tx":2,"agent":"agent-B","holder":1,"holder_agent":"agent-A","wait_kind":2,"wait_name":"OUTPUT","why":"B needs main.c, which A has not committed"}
+{"sim":true,"seq":9,"kind":"deadlock","cycle":[1,2],"agents":["agent-A","agent-B"],"states":["active","active"],"worst":[0,1],"edge_kinds":["OUTPUT"],"n_doomed":0}
+{"sim":true,"seq":10,"kind":"victim","tx":1,"agent":"agent-A","policy":"least-severe","worst":0,"cost":2,"forced":false,"n_abortable":2,"n_doomed":0}
+{"sim":true,"seq":11,"kind":"abort","tx":1,"agent":"agent-A","reason":"deadlock","released":["/repo/src/main.c"],"wal_dropped":1}
+{"sim":true,"seq":1,"kind":"begin","tx":1,"agent":"agent-A","parent":null}
+{"sim":true,"seq":2,"kind":"begin","tx":2,"agent":"agent-B","parent":null}
+{"sim":true,"seq":3,"kind":"write","tx":1,"agent":"agent-A","path":"/repo/deploy.yaml","write_set":1}
+{"sim":true,"seq":4,"kind":"write","tx":2,"agent":"agent-B","path":"/repo/config.json","write_set":1}
+{"sim":true,"seq":5,"kind":"doomed","tx":1,"agent":"agent-A","what":"POST /api/v1/deploy production","worst":3}
+{"sim":true,"seq":6,"kind":"effect","tx":2,"agent":"agent-B","what":"write config.json","klass":0,"klass_name":"reversible","wal":1}
+{"sim":true,"seq":7,"kind":"wait","tx":1,"agent":"agent-A","holder":2,"holder_agent":"agent-B","wait_kind":2,"wait_name":"OUTPUT","why":"A needs B's config.json"}
+{"sim":true,"seq":8,"kind":"wait","tx":2,"agent":"agent-B","holder":1,"holder_agent":"agent-A","wait_kind":2,"wait_name":"OUTPUT","why":"B needs A's deploy.yaml"}
+{"sim":true,"seq":9,"kind":"deadlock","cycle":[1,2],"agents":["agent-A","agent-B"],"states":["doomed","active"],"worst":[3,0],"edge_kinds":["OUTPUT"],"n_doomed":1}
+{"sim":true,"seq":10,"kind":"victim","tx":2,"agent":"agent-B","policy":"least-severe","worst":0,"cost":2,"forced":true,"n_abortable":1,"n_doomed":1}
+{"sim":true,"seq":11,"kind":"abort","tx":2,"agent":"agent-B","reason":"deadlock","released":["/repo/config.json"],"wal_dropped":1}
+{"sim":true,"seq":1,"kind":"begin","tx":1,"agent":"parent","parent":null}
+{"sim":true,"seq":2,"kind":"begin","tx":2,"agent":"subagent-1","parent":"parent"}
+{"sim":true,"seq":3,"kind":"begin","tx":3,"agent":"subagent-2","parent":"parent"}
+{"sim":true,"seq":4,"kind":"write","tx":1,"agent":"parent","path":"/repo/plan.md","write_set":1}
+{"sim":true,"seq":5,"kind":"write","tx":2,"agent":"subagent-1","path":"/repo/src/api.c","write_set":1}
+{"sim":true,"seq":6,"kind":"write","tx":3,"agent":"subagent-2","path":"/repo/tests/test_api.c","write_set":1}
+{"sim":true,"seq":7,"kind":"effect","tx":2,"agent":"subagent-1","what":"POST /notify api rewritten","klass":1,"klass_name":"deferrable","wal":1}
+{"sim":true,"seq":8,"kind":"effect","tx":3,"agent":"subagent-2","what":"write test file","klass":0,"klass_name":"reversible","wal":1}
+{"sim":true,"seq":9,"kind":"wait","tx":3,"agent":"subagent-2","holder":2,"holder_agent":"subagent-1","wait_kind":2,"wait_name":"OUTPUT","why":"test needs subagent-1's api.c"}
+{"sim":true,"seq":10,"kind":"effect","tx":2,"agent":"subagent-1","what":"charge the build-minutes account","klass":2,"klass_name":"compensable","wal":2}
+{"sim":true,"seq":11,"kind":"wait","tx":2,"agent":"subagent-1","holder":1,"holder_agent":"parent","wait_kind":1,"wait_name":"ESCALATE","why":"subagent-1 blocked awaiting parent approval"}
+{"sim":true,"seq":12,"kind":"wait","tx":1,"agent":"parent","holder":3,"holder_agent":"subagent-2","wait_kind":2,"wait_name":"OUTPUT","why":"parent waits for subagent-2's test result"}
+{"sim":true,"seq":13,"kind":"deadlock","cycle":[3,2,1],"agents":["subagent-2","subagent-1","parent"],"states":["active","active","active"],"worst":[0,2,0],"edge_kinds":["ESCALATE","OUTPUT"],"n_doomed":0}
+{"sim":true,"seq":14,"kind":"victim","tx":1,"agent":"parent","policy":"least-severe","worst":0,"cost":1,"forced":false,"n_abortable":3,"n_doomed":0}
+{"sim":true,"seq":15,"kind":"stranded","tx":1,"agent":"parent","waiters":[2],"waiter_agents":["subagent-1"],"consequence":"the approver was the victim; these waiters are asleep in a hook awaiting an approval nobody can now give","policy":"P3-10: timeout is deny \u2014 they will be denied, not resumed"}
+{"sim":true,"seq":16,"kind":"abort","tx":1,"agent":"parent","reason":"deadlock","released":["/repo/plan.md"],"wal_dropped":0}
+{"sim":true,"seq":1,"kind":"begin","tx":1,"agent":"agent-A","parent":null}
+{"sim":true,"seq":2,"kind":"begin","tx":2,"agent":"agent-B","parent":null}
+{"sim":true,"seq":3,"kind":"write","tx":1,"agent":"agent-A","path":"/repo/a.txt","write_set":1}
+{"sim":true,"seq":4,"kind":"write","tx":2,"agent":"agent-B","path":"/repo/b.txt","write_set":1}
+{"sim":true,"seq":5,"kind":"doomed","tx":1,"agent":"agent-A","what":"POST /payments/capture","worst":3}
+{"sim":true,"seq":6,"kind":"doomed","tx":2,"agent":"agent-B","what":"sendmail to 400 customers","worst":3}
+{"sim":true,"seq":7,"kind":"wait","tx":1,"agent":"agent-A","holder":2,"holder_agent":"agent-B","wait_kind":2,"wait_name":"OUTPUT","why":"A needs b.txt"}
+{"sim":true,"seq":8,"kind":"wait","tx":2,"agent":"agent-B","holder":1,"holder_agent":"agent-A","wait_kind":2,"wait_name":"OUTPUT","why":"B needs a.txt"}
+{"sim":true,"seq":9,"kind":"deadlock","cycle":[1,2],"agents":["agent-A","agent-B"],"states":["doomed","doomed"],"worst":[3,3],"edge_kinds":["OUTPUT"],"n_doomed":2}
+{"sim":true,"seq":10,"kind":"unresolvable","cycle":[1,2],"agents":["agent-A","agent-B"],"reason":"every transaction in the cycle is DOOMED; DOOMED -> ABORTING does not exist","remaining_moves":["deny an ESCALATE approval (the effect already happened, so denial dooms nothing further)","escalate the whole cycle to a human"]}

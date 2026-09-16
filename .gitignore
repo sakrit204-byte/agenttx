@@ -1,0 +1,73 @@
+# kernel module build output
+*.o
+*.o.d
+*.ko
+*.mod
+*.mod.c
+*.symvers
+*.order
+.tmp_versions/
+.*.cmd
+Module.symvers
+modules.order
+
+# BPF build output
+*.bpf.o
+*.skel.h
+vmlinux.h
+
+# generated tracker aggregate (WORKFLOW.md section 2)
+tracker/master.csv
+
+# VM artefacts - never commit a multi-GB rootfs or kernel image
+tools/vm/build/
+tools/vm/*.img
+tools/vm/*.qcow2
+tools/vm/bzImage
+tools/vm/vmlinux
+
+# compiled userspace tools -- build them, do not ship them
+tools/harness/txctl
+src/bpf/txload
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# generated model artefacts (regenerate with `make train quantize weights`)
+data/traces/
+data/model/
+tools/harness/out/
+
+# RAW TRACES ARE NEVER COMMITTED.
+#
+# A raw strace of a real agent is a capture of an AUTHENTICATED session. Ours
+# contained an OAuth token fragment in a captured buffer:
+# strace -s 64 truncates each buffer at 64 bytes, but 64 bytes of an
+# Authorization header is still 64 bytes of a credential.
+#
+# docs/trace-format.md already states the rule -- "real captures never carry
+# payload bytes out of the machine that made them" -- and the .jsonl records
+# honour it (payload_prefix is null in all 46). The raw strace does not, and
+# it is the file that would have leaked.
+#
+# Keep raw traces local. Commit the derived .jsonl and .summary.json, which
+# are the evidence anyone else actually needs.
+*.strace
+*.strace.gz
+*.strace.xz
+data/gate/*.raw
+
+# benchmark output
+results/
+
+# LaTeX
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.synctex.gz

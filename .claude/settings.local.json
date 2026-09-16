@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "PowerShell($found = @\\(\\); foreach \\($c in 'pdflatex','xelatex','lualatex','latexmk','tectonic','pandoc','miktex-console'\\) { $p = Get-Command $c -ErrorAction SilentlyContinue; if \\($p\\) { $found += \"$c -> $\\($p.Source\\)\" } }; if \\($found.Count -eq 0\\) { \"NONE FOUND\" } else { $found })",
+      "PowerShell($w = Get-Command winget -ErrorAction SilentlyContinue; if \\($w\\) { \"winget: $\\($w.Source\\)\" } else { \"winget NOT FOUND\" })",
+      "PowerShell(winget install *)",
+      "PowerShell($c = @\\(\"$env:LOCALAPPDATA\\\\Programs\\\\MiKTeX\\\\miktex\\\\bin\\\\x64\",\"C:\\\\Program Files\\\\MiKTeX\\\\miktex\\\\bin\\\\x64\",\"C:\\\\Program Files \\(x86\\)\\\\MiKTeX\\\\miktex\\\\bin\"\\); foreach \\($p in $c\\) { if \\(Test-Path \"$p\\\\pdflatex.exe\"\\) { \"FOUND: $p\" } })",
+      "PowerShell(initexmf *)",
+      "PowerShell(bibtex agenttx-proposal *)",
+      "PowerShell(Set-Location \"C:\\\\Users\\\\ACER\\\\Desktop\\\\os_project\\\\ideas\\\\paper\"; $log = Get-Content agenttx-proposal.log -Raw; $und = \\([regex]::Matches\\($log,'Citation .[^'']+. undefined'\\)\\).Count; $ref = \\([regex]::Matches\\($log,'Reference .[^'']+. undefined'\\)\\).Count; \"Undefined citations: $und\"; \"Undefined refs:      $ref\"; \"\"; Get-ChildItem agenttx-proposal.pdf | Select-Object Name, @{n='KB';e={[math]::Round\\($_.Length/1KB\\)}}, LastWriteTime | Format-List)",
+      "WebFetch(domain:www.cs.utexas.edu)"
+    ]
+  }
+}

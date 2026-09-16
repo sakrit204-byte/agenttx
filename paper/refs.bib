@@ -1,0 +1,391 @@
+% ============================================================
+% AgentTx bibliography
+%
+% SECTION A entries are verified (venue, year, authors confirmed).
+% SECTION B entries were gathered from search results in Aug 2026;
+%   the arXiv IDs and titles look right but AUTHORS AND VENUES ARE
+%   UNVERIFIED. Open each paper and complete the entry before you
+%   submit anything. Entries carrying a "VERIFY" note are not safe
+%   to cite as-is.
+% ============================================================
+
+
+% ---------- SECTION A: verified foundational work ----------
+
+@inproceedings{porter2009txos,
+  author    = {Porter, Donald E. and Hofmann, Owen S. and Rossbach,
+               Christopher J. and Benn, Alexander and Witchel, Emmett},
+  title     = {Operating System Transactions},
+  booktitle = {Proceedings of the 22nd ACM Symposium on Operating Systems
+               Principles (SOSP '09)},
+  year      = {2009},
+  address   = {Big Sky, MT, USA},
+  publisher = {ACM},
+  doi       = {10.1145/1629575.1629591},
+  note      = {TxOS. VERIFIED against the paper 2026-08-04. 150 of 303 syscalls
+               transactional (Table 1); socket/ipc/mq_open unsupported;
+               unsupported call logs a warning or aborts per sys_xbegin flags
+               (\S3.2); no irrevocable-transaction mechanism; application state
+               not reverted on abort (\S3.1.4); request-response communication
+               identified as non-transactional with buffering suggested and
+               responsibility assigned to the programmer (\S3.1.5); long-running
+               transaction sizing explicitly left as open policy (\S3.1.3)}
+}
+
+@inproceedings{porter2009hotos,
+  author    = {Porter, Donald E. and Witchel, Emmett},
+  title     = {Operating Systems Should Provide Transactions},
+  booktitle = {Proceedings of the 12th Workshop on Hot Topics in Operating
+               Systems (HotOS XII)},
+  year      = {2009}
+}
+
+@inproceedings{nightingale2005speculator,
+  author    = {Nightingale, Edmund B. and Chen, Peter M. and Flinn, Jason},
+  title     = {Speculative Execution in a Distributed File System},
+  booktitle = {Proceedings of the 20th ACM Symposium on Operating Systems
+               Principles (SOSP '05)},
+  year      = {2005},
+  publisher = {ACM},
+  doi       = {10.1145/1095810.1095829},
+  note      = {Best Paper. Kernel support for speculation, checkpoint/rollback,
+               causal dependency tracking across IPC}
+}
+
+@inproceedings{nightingale2006xsyncfs,
+  author    = {Nightingale, Edmund B. and Veeraraghavan, Kaushik and
+               Chen, Peter M. and Flinn, Jason},
+  title     = {Rethink the Sync},
+  booktitle = {Proceedings of the 7th USENIX Symposium on Operating Systems
+               Design and Implementation (OSDI '06)},
+  year      = {2006},
+  note      = {Best Paper. External synchrony: buffer externally visible
+               output until the state it depends on is durable. Direct
+               ancestor of AgentTx's deferred-effect log}
+}
+
+@inproceedings{hu2018txfs,
+  author    = {Hu, Yige and Zhu, Zhiting and Neal, Ian and Kwon, Youngjin and
+               Cheng, Tianyu and Chidambaram, Vijay and Witchel, Emmett},
+  title     = {{TxFS}: Leveraging File-System Crash Consistency to Provide
+               {ACID} Transactions},
+  booktitle = {Proceedings of the 2018 USENIX Annual Technical Conference
+               (USENIX ATC '18)},
+  year      = {2018},
+  note      = {Best Paper. Reuses the ext4 journal for ACID file-system
+               transactions; 5{,}200 LoC}
+}
+
+@article{hu2019txfs,
+  author    = {Hu, Yige and Zhu, Zhiting and Neal, Ian and Kwon, Youngjin and
+               Cheng, Tianyu and Chidambaram, Vijay and Witchel, Emmett},
+  title     = {{TxFS}: Leveraging File-System Crash Consistency to Provide
+               {ACID} Transactions},
+  journal   = {ACM Transactions on Storage},
+  volume    = {15},
+  number    = {2},
+  year      = {2019},
+  doi       = {10.1145/3318159},
+  note      = {Extended journal version of \cite{hu2018txfs}}
+}
+
+@inproceedings{zadok2000fist,
+  author    = {Zadok, Erez and Nieh, Jason},
+  title     = {{FiST}: A Language for Stackable File Systems},
+  booktitle = {Proceedings of the 2000 USENIX Annual Technical Conference},
+  year      = {2000},
+  address   = {San Diego, CA, USA}
+}
+
+@inproceedings{zadok1999wrapfs,
+  author    = {Zadok, Erez and Badulescu, Ion},
+  title     = {A Stackable File System Interface for {Linux}},
+  booktitle = {Proceedings of the Linux Expo},
+  year      = {1999},
+  note      = {Wrapfs templates; basis of eCryptfs and Unionfs. Start here
+               if you build a stackable FS rather than using overlayfs}
+}
+
+@article{akgun2023kml,
+  author    = {Akgun, Ibrahim Umit and Aydin, Ali Selman and Burford, Andrew
+               and McNeill, Michael and Arkhangelskiy, Michael and
+               Zadok, Erez},
+  title     = {Improving Storage Systems Using Machine Learning},
+  journal   = {ACM Transactions on Storage},
+  year      = {2023},
+  doi       = {10.1145/3568429},
+  note      = {KML. In-kernel neural nets and decision trees in under 4\,KB of
+               kernel memory, CPU overhead below 0.2\%}
+}
+
+@misc{akgun2021kmlarxiv,
+  author       = {Akgun, Ibrahim Umit and Aydin, Ali Selman and Burford, Andrew
+                  and McNeill, Michael and Arkhangelskiy, Michael and
+                  Zadok, Erez},
+  title        = {{KML}: Using Machine Learning to Improve Storage Systems},
+  year         = {2021},
+  howpublished = {arXiv:2111.11554},
+  url          = {https://arxiv.org/abs/2111.11554}
+}
+
+@misc{debenedetti2025camel,
+  author       = {Debenedetti, Edoardo and others},
+  title        = {Defeating Prompt Injections by Design},
+  year         = {2025},
+  howpublished = {arXiv:2503.18813},
+  url          = {https://arxiv.org/abs/2503.18813},
+  note         = {CaMeL. Capability-based control/data-flow separation for
+                  tool-using agents; 77\% of AgentDojo tasks with provable
+                  security. VERIFY full author list}
+}
+
+@inproceedings{ebpffixedpoint2024,
+  title     = {Dynamic Fixed-point Values in {eBPF}: A Case for Fully
+               In-kernel Anomaly Detection},
+  booktitle = {Proceedings of the ACM SIGCOMM Workshop on eBPF and Kernel
+               Extensions},
+  year      = {2024},
+  doi       = {10.1145/3674213.3674219},
+  note      = {VERIFY authors. The fixed-point technique AgentTx's in-kernel
+               classifier depends on}
+}
+
+@article{kernelpacketml2024,
+  title   = {Practicality of In-kernel/User-space Packet Processing Empowered
+             by Lightweight Neural Network and Decision Tree},
+  journal = {Computer Networks},
+  year    = {2024},
+  doi     = {10.1016/j.comnet.2024.110192},
+  note    = {VERIFY authors and DOI. int8 quantisation, weights in BPF maps,
+             per-layer tail calls, ~84\% lower inference latency than
+             user space}
+}
+
+@misc{ebpfml2024,
+  title        = {When {eBPF} Meets Machine Learning: On-the-fly {OS} Kernel
+                  Compartmentalization},
+  year         = {2024},
+  howpublished = {arXiv:2401.05641},
+  url          = {https://arxiv.org/abs/2401.05641},
+  note         = {VERIFY authors}
+}
+
+@misc{syscallprivilege2024,
+  author       = {Yang, Fangfei and others},
+  title        = {Making \texttt{syscall} a Privilege not a Right},
+  year         = {2024},
+  howpublished = {arXiv:2406.07429},
+  url          = {https://arxiv.org/abs/2406.07429},
+  note         = {VERIFY full author list}
+}
+
+
+% ---------- SECTION B: recent agent work -- ALL NEED VERIFYING ----------
+
+@misc{ftsandbox2025,
+  title        = {Fault-Tolerant Sandboxing for {AI} Coding Agents: A
+                  Transactional Approach to Safe Autonomous Execution},
+  year         = {2025},
+  howpublished = {arXiv:2512.12806},
+  url          = {https://arxiv.org/abs/2512.12806},
+  note         = {CLOSEST PRIOR WORK. Policy-based interception plus
+                  transactional FS snapshots; reports 100\% interception of
+                  high-risk commands, 100\% rollback success, 14.5\% overhead.
+                  VERIFY authors and venue}
+}
+
+@misc{deltabox2026,
+  title        = {{DeltaBox}: Scaling Stateful {AI} Agents with
+                  Millisecond-Level Sandbox Checkpoint/Rollback},
+  year         = {2026},
+  howpublished = {arXiv:2605.22781},
+  url          = {https://arxiv.org/abs/2605.22781},
+  note         = {DeltaState abstraction; DeltaFS is OverlayFS-inspired
+                  change-based FS checkpoint/restore. VERIFY authors}
+}
+
+@misc{cordon2026,
+  title        = {{Cordon}: Semantic Transactions for Tool-Using {LLM} Agents},
+  year         = {2026},
+  howpublished = {arXiv:2606.17573},
+  url          = {https://arxiv.org/abs/2606.17573},
+  note         = {Transactions at the tool-call boundary rather than the
+                  syscall boundary. VERIFY authors}
+}
+
+@misc{agentsight2025,
+  title        = {{AgentSight}: System-Level Observability for {AI} Agents
+                  Using {eBPF}},
+  year         = {2025},
+  howpublished = {arXiv:2508.02736},
+  url          = {https://arxiv.org/abs/2508.02736},
+  note         = {Correlates TLS-intercepted LLM traffic with kernel events,
+                  under 3\% overhead. VERIFY authors}
+}
+
+@misc{chronomem2026,
+  title        = {{ChronoMem}: Version Control and Semantic Rollback for Large
+                  Language Model Agent Memory},
+  year         = {2026},
+  howpublished = {arXiv:2607.27773},
+  note         = {VERIFY}
+}
+
+@misc{memtx2026,
+  title        = {{MemTX}: Transactional Belief Commit for Stateful Agent
+                  Memory},
+  year         = {2026},
+  howpublished = {arXiv:2607.23929},
+  note         = {VERIFY}
+}
+
+@misc{acrfence2026,
+  title        = {{ACRFence}: Preventing Semantic Rollback Attacks in Agent
+                  Checkpoint-Restore},
+  year         = {2026},
+  howpublished = {arXiv:2603.20625},
+  note         = {Attacks against rollback itself --- read before you claim
+                  your rollback is safe. VERIFY}
+}
+
+@misc{alwayson2026,
+  title        = {Always-On Agents: A Survey of Persistent Memory, State, and
+                  Governance in {LLM} Agents},
+  year         = {2026},
+  howpublished = {arXiv:2606.30306},
+  note         = {Survey --- good entry point and citation mine. VERIFY}
+}
+
+@misc{actplane,
+  title        = {{ActPlane}: In-Kernel Agent Action Policy Enforcement with
+                  {eBPF} and Information-Flow Control},
+  year         = {2026},
+  note         = {CITATION INCOMPLETE. Referenced in secondary sources only;
+                  locate the primary paper before citing. Overlaps AgentTx's
+                  P3 workstream}
+}
+
+@misc{crab,
+  title        = {{CRAB}: Aligning Durable Checkpoints with Agent Turn
+                  Boundaries via {eBPF} Effect Classification},
+  year         = {2026},
+  note         = {CITATION INCOMPLETE. Referenced in secondary sources only;
+                  locate the primary paper before citing. Overlaps AgentTx's
+                  effect-classification contribution}
+}
+
+
+% ---------- SECTION C: non-archival, useful for motivation ----------
+
+@misc{armo2026,
+  title        = {{eBPF} for {AI} Agent Enforcement: What Kernel-Level Security
+                  Catches (and What It Misses)},
+  author       = {{ARMO}},
+  year         = {2026},
+  howpublished = {Industry blog post},
+  url          = {https://www.armosec.io/blog/ebpf-based-ai-agent-enforcement/},
+  note         = {Argues Tetragon/Falco/KubeArmor assume deterministic
+                  workloads; agents are not. Good motivation quote}
+}
+
+@misc{rollbackpatterns2026,
+  title        = {Agent Rollback and Checkpoint Patterns: A 2026 Engineering
+                  Reference},
+  year         = {2026},
+  howpublished = {Industry reference},
+  url          = {https://www.digitalapplied.com/blog/agent-rollback-checkpoint-patterns-2026-engineering-reference},
+  note         = {Three reversibility tiers: checkpoints, sagas, idempotency
+                  keys. All application-layer --- the gap AgentTx targets.
+                  Source of the tier-3 impossibility claim we quote}
+}
+
+
+% ---------- SECTION D: irrevocability in transactional memory ----------
+% The correct theoretical frame for "what happens when a transaction does
+% I/O it cannot undo". VERIFY venues and years against the ACM DL.
+
+@inproceedings{welc2008irrevocable,
+  author    = {Welc, Adam and Saha, Bratin and Adl-Tabatabai, Ali-Reza},
+  title     = {Irrevocable Transactions and Their Applications},
+  booktitle = {Proceedings of the 20th ACM Symposium on Parallelism in
+               Algorithms and Architectures (SPAA '08)},
+  year      = {2008},
+  note      = {VERIFY venue/year. A transaction performing un-undoable work
+               becomes irrevocable: the system guarantees it will not abort
+               rather than attempting to reverse the I/O}
+}
+
+@inproceedings{spear2008inevitability,
+  author    = {Spear, Michael F. and Silverman, Michael and Dalessandro, Luke
+               and Michael, Maged M. and Scott, Michael L.},
+  title     = {Implementing and Exploiting Inevitability in Software
+               Transactional Memory},
+  booktitle = {Proceedings of the 37th International Conference on Parallel
+               Processing (ICPP '08)},
+  year      = {2008},
+  note      = {VERIFY venue/year and author list}
+}
+
+
+% ---------- SECTION E: production systems, Aug 2026 ----------
+% Non-archival but load-bearing: these establish what is already solved.
+
+@misc{codexsandbox,
+  author       = {{OpenAI}},
+  title        = {Codex {CLI} Sandboxing Implementation},
+  year         = {2026},
+  howpublished = {Project documentation},
+  url          = {https://deepwiki.com/openai/codex/5.6-sandboxing-implementation},
+  note         = {bubblewrap + unprivileged user namespaces + Landlock LSM +
+                  seccomp-BPF on Linux; Seatbelt on macOS; restricted tokens
+                  and synthetic SIDs on Windows. Default-deny egress with
+                  allowlists and DNS/IP classification}
+}
+
+@misc{ccrewind,
+  title        = {Claude Code Checkpoints and Rewind},
+  year         = {2026},
+  howpublished = {Product documentation},
+  url          = {https://likeone.ai/blog/claude-code-checkpoints-rewind-guide-2026/},
+  note         = {Checkpoints recorded before every filesystem-modifying
+                  action; rewind restores to any prior tool call. Evidence
+                  that filesystem rollback is commodity}
+}
+
+@misc{chatgptwork,
+  title        = {{ChatGPT} Work: A Production Agent Control Plane},
+  year         = {2026},
+  howpublished = {Industry analysis},
+  url          = {https://www.nxcode.io/resources/news/gpt-5-6-chatgpt-work-production-agent-control-plane-2026},
+  note         = {Plan mode, configurable check-ins, action approvals.
+                  Irreversible actions gated on a human in the tool
+                  implementation}
+}
+
+@misc{agentapprovals,
+  author       = {{OpenAI}},
+  title        = {Agent Approvals and Security},
+  year         = {2026},
+  howpublished = {Product documentation},
+  url          = {https://learn.chatgpt.com/docs/agent-approvals-security}
+}
+
+@misc{sandboxescapes,
+  title        = {Your Coding Agent Sandbox Probably Leaks. Here Is Where},
+  year         = {2026},
+  howpublished = {Industry analysis},
+  url          = {https://www.digitalapplied.com/blog/agent-sandbox-escapes-worktree-symlink-command-filters-2026},
+  note         = {Symlink and worktree escapes; motivates why coverage is the
+                  weak point of any interception design}
+}
+
+@misc{cursorincident,
+  title        = {Coding Agent Wipes Production Database and Backups in Nine
+                  Seconds},
+  year         = {2026},
+  howpublished = {Press report},
+  url          = {https://startupfortune.com/cursors-claude-agent-wipes-production-database-and-backups-in-9-seconds/},
+  note         = {Motivating incident. VERIFY details independently before
+                  citing --- press reports of such incidents are frequently
+                  inaccurate in the specifics}
+}
