@@ -382,6 +382,12 @@ def gate_summary() -> dict:
             "lines_total": data.get("lines_total"),
             "syscall": data["syscall"],
             "connection": data["connection"],
+            # The unit that means "one effect" (docs/gate-result.md). Absent
+            # from summaries written before it existed, so the panel must
+            # cope with None rather than render a confident 0.
+            "request": data.get("request"),
+            "stitched": data.get("lines_stitched", 0),
+            "unaccounted": data.get("lines_unaccounted"),
             "verdict": data.get("verdict"),
             "trustworthy": data.get("trustworthy", False),
         })
@@ -596,6 +602,21 @@ class Handler(BaseHTTPRequestHandler):
             srv.dev.open()
             body = json.dumps(snapshot(srv.dev, srv.dmesg, srv.replay)).encode()
             self._send(200, body, "application/json")
+            return
+
+        if path == "/api/labels":
+            import csv as _csv
+            out = {"available": False, "counts": {}, "rules": {}, "total": 0}
+            f = REPO / "data" / "labels.csv"
+            if f.exists():
+                for r in _csv.DictReader(f.open(newline="")):
+                    lab = r.get("label") or "?"
+                    out["counts"][lab] = out["counts"].get(lab, 0) + 1
+                    why = r.get("rule") or "?"
+                    out["rules"][why] = out["rules"].get(why, 0) + 1
+                    out["total"] += 1
+                out["available"] = out["total"] > 0
+            self._send(200, json.dumps(out).encode(), "application/json")
             return
 
         if path == "/api/fragments":

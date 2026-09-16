@@ -232,82 +232,107 @@ function renderTx(stat, present) {
 function renderGate(g) {
   const box = $('gate');
   if (!g || !g.available) {
-    let h = `<div class="missing">no summarised gate run.<br><br>
+    box.innerHTML = `<div class="missing">no summarised gate run.<br><br>
       <code>strace -f -tt -yy -e trace=network,desc -o t.strace &lt;agent&gt;</code><br>
       <code>python3 tools/harness/measure_gate.py --strace t.strace \
         --jsonl data/gate/run.jsonl --summary data/gate/run.summary.json</code></div>`;
-    if (g && g.unsummarised?.length) {
-      h += `<p class="note warn">${g.unsummarised.length} record file(s) have no
-        summary: ${g.unsummarised.map(esc).join(', ')}. Re-run measure_gate.py with
-        <code>--summary</code>. The connection figure cannot be recovered from the
-        records alone — they contain only outbound operations.</p>`;
-    }
+    return;
+  }
+  const runs = g.runs.filter(r => r.request);          // need all three units
+  const band = (p) => p > 20 ? 'rev' : p >= 10 ? 'comp' : 'irr';
+  const mean = (a) => a.reduce((x, y) => x + y, 0) / (a.length || 1);
+
+  const sysM = mean(runs.map(r => r.syscall.pct));
+  const reqM = mean(runs.map(r => r.request.pct));
+  const conM = mean(runs.map(r => r.connection.pct));
+  const spread = reqM > 0.01 ? (sysM / reqM) : null;
+  const verdict = reqM > 20 ? 'PASS' : reqM >= 10 ? 'MARGINAL' : 'FAIL';
+
+  let h = '';
+
+  if (!runs.length) {
+    h = `<p class="note warn">${g.runs.length} run(s) have no logical-request
+      figure — they were summarised before that unit existed. Re-run
+      <code>measure_gate.py --summary</code>.</p>`;
     box.innerHTML = h;
     return;
   }
-  let h = '';
-  g.runs.forEach(r => {
-    const s = r.syscall, c = r.connection;
-    const band = (p) => p > 20 ? 'rev' : p >= 10 ? 'comp' : 'irr';
-    const ratio = c.pct > 0.01 ? (s.pct / c.pct) : null;
-    const parsePct = r.lines_total ? 100 * r.lines_parsed / r.lines_total : null;
-    h += `
-    <div class="grid g2" style="margin:0 0 6px">
-      <div>
-        <div class="note">per syscall — what the gate threshold is written against</div>
-        <div class="big ${band(s.pct)}">${pct(s.pct)}</div>
-        <div class="bar">
-          <i style="width:${100*s.ff/s.total}%;background:var(--def)"></i>
-          <i style="width:${100*s.rr/s.total}%;background:var(--comp)"></i>
-          <i style="width:${100*s.undetermined/s.total}%;background:var(--dimmer)"></i>
-        </div>
-        <div class="legend">
-          <span><b style="color:var(--def)">${s.ff}</b> fire-and-forget</span>
-          <span><b style="color:var(--comp)">${s.rr}</b> request-response</span>
-          <span><b>${s.undetermined}</b> undetermined</span>
-        </div>
-      </div>
-      <div>
-        <div class="note">per connection — a connection that ever read a byte back</div>
-        <div class="big ${band(c.pct)}">${pct(c.pct)}</div>
-        <div class="bar">
-          <i style="width:${c.pct}%;background:var(--def)"></i>
-          <i style="width:${100-c.pct}%;background:var(--comp)"></i>
-        </div>
-        <div class="legend">
-          <span><b style="color:var(--def)">${c.ff}</b> of ${c.total} connections never read a reply</span>
-          <span><b>${c.ops_on_ff}</b> of ${s.total} ops sit on those</span>
-        </div>
-      </div>
-    </div>`;
 
-    if (!r.trustworthy && ratio) {
-      h += `<p class="note bad" style="margin-top:10px">
-        <b>Both numbers come from the same trace (<code>${esc(r.file)}</code>,
-        ${s.total} outbound operations) and disagree by ${ratio.toFixed(0)}×.</b>
-        The per-syscall figure counts MTU-sized TLS fragments of a single logical
-        request as independent effects, inflating fire-and-forget in the project's
-        own favour. The per-connection figure scores a persistent connection that
-        carries a blocking request <em>and</em> a fire-and-forget ping entirely as
-        request-response, deflating it. The true value is bracketed between them;
-        neither is publishable alone. The unit that would settle it is the logical
-        request, which needs request framing the tool does not parse —
-        <code>docs/journal/p4.md</code>.</p>`;
-    } else if (r.trustworthy) {
-      h += `<p class="note" style="margin-top:10px">The two units agree to within
-        1.5×, which is the strongest statement this method supports.</p>`;
-    }
-    if (parsePct != null && parsePct < 95) {
-      h += `<p class="note warn"><b>${(100-parsePct).toFixed(0)}% of the trace did not
-        parse</b> (${r.lines_parsed} of ${r.lines_total} lines). Unfinished/resumed
-        pairs across threads are the likely cause, and those are exactly where a
-        blocking read appears — so the parse gap is not obviously neutral in either
-        direction. Quantify before trusting either figure.</p>`;
-    }
-    h += `<p class="note">gate threshold verdict on the per-syscall figure:
-      <b style="color:var(--${band(s.pct)})">${esc(r.verdict)}</b>
-      — recorded, not acted on, while the two units disagree.</p>`;
+  // --- the three units, side by side --------------------------------
+  h += `<div class="grid g3" style="gap:12px;margin-bottom:4px">
+    <div>
+      <div class="note">per syscall</div>
+      <div class="big ${band(sysM)}">${pct(sysM)}</div>
+      <div class="note" style="color:var(--dimmer)">counts TLS fragments of one
+        request as independent effects — wrong, and wrong in our favour</div>
+    </div>
+    <div style="border-left:2px solid var(--accent);padding-left:12px">
+      <div class="note" style="color:var(--ink)"><b>per logical request</b></div>
+      <div class="big ${band(reqM)}">${pct(reqM)}</div>
+      <div class="note" style="color:var(--dimmer)">a run of writes uninterrupted
+        by a read — <b>the unit that means "one effect"</b></div>
+    </div>
+    <div>
+      <div class="note">per connection</div>
+      <div class="big ${band(conM)}">${pct(conM)}</div>
+      <div class="note" style="color:var(--dimmer)">collapses a connection
+        carrying both kinds into one verdict</div>
+    </div>
+  </div>`;
+
+  // --- the verdict ---------------------------------------------------
+  const vcls = verdict === 'PASS' ? 'vb-abort' : 'vb-commit';
+  h += `<div class="verdictbar ${verdict === 'FAIL' ? '' : vcls}"
+          style="${verdict === 'FAIL'
+            ? 'color:var(--irr);border-color:#5c2321;background:#1f0f0e' : ''}">
+    <b>GATE: ${verdict}</b> &nbsp;—&nbsp; PROPOSAL.md: &gt;20% proceed ·
+    10–20% narrowed claim · &lt;10% <i>“promote contributions 2 and 5 to the
+    headline; Contribution 1’s ceiling is this number.”</i>
+    ${verdict === 'FAIL'
+      ? `<br><br>At ${pct(reqM)}, kernel deferral has a ceiling of about
+         ${reqM.toFixed(0)}% of an agent’s outbound effects. The mechanism works
+         (<code>tests/p3/t07</code>, <code>t08</code>) — it has very little to act
+         on, because an agent’s traffic is almost entirely request-response with
+         its model provider and it blocks on every reply.`
+      : ''}
+  </div>`;
+
+  // --- per-run table -------------------------------------------------
+  h += `<div class="scroll" style="max-height:220px;margin-top:8px"><table>
+    <thead><tr><th>task shape</th><th class="num">ops</th>
+      <th class="num">syscall</th><th class="num">request</th>
+      <th class="num">conn</th><th class="num">stitched</th>
+      <th class="num">unacct</th></tr></thead><tbody>`;
+  runs.forEach(r => {
+    const un = r.unaccounted;
+    h += `<tr>
+      <td>${esc(r.file.replace('.jsonl', ''))}</td>
+      <td class="num">${r.syscall.total}</td>
+      <td class="num" style="color:var(--dimmer)">${r.syscall.pct.toFixed(1)}%</td>
+      <td class="num" style="color:var(--ink)"><b>${r.request.pct.toFixed(1)}%</b></td>
+      <td class="num" style="color:var(--dimmer)">${r.connection.pct.toFixed(1)}%</td>
+      <td class="num" style="color:var(--dim)">${r.stitched ?? '—'}</td>
+      <td class="num" style="color:${un === 0 ? 'var(--rev)' : 'var(--irr)'}">${un ?? '?'}</td>
+    </tr>`;
   });
+  h += `</tbody></table></div>`;
+
+  h += `<p class="note" style="margin-top:10px">
+    <b>${runs.length} traces, ${runs.reduce((a, r) => a + r.syscall.total, 0)} outbound
+    operations, 0 unaccounted lines.</b> The three units disagree by
+    ${spread ? spread.toFixed(0) + '×' : '—'}, which is why every figure here names
+    its unit. A paper reporting this fraction without one cannot be checked.</p>`;
+
+  h += `<p class="note warn"><b>stitched</b> is the count of
+    <code>&lt;unfinished&gt;</code>/<code>&lt;resumed&gt;</code> syscall pairs
+    recovered. Discarding them threw away 34–66% of every trace and dropped 1571
+    <em>inbound</em> operations — replies we never saw, so their sends looked
+    unanswered. That error moved the headline from 6.3% to 2.9%, in our own
+    favour. <b>unacct</b> must be 0 or nothing below is trustworthy.</p>`;
+
+  h += `<p class="note" style="color:var(--dimmer)">Biggest threat: one agent.
+    Every trace is Claude Code. See <code>docs/gate-result.md</code> §5.</p>`;
+
   box.innerHTML = h;
 }
 
@@ -889,3 +914,102 @@ renderProcTree();
 renderFragments();
 refreshSystem();
 setInterval(refreshSystem, 4000);
+
+
+/* ============================================================
+ * Effect taxonomy, applied
+ * ==========================================================*/
+async function renderLabels() {
+  const box = $('labels');
+  if (!box) return;
+  try {
+    const d = await (await fetch('/api/labels')).json();
+    if (!d.available) {
+      box.innerHTML = `<div class="missing">no labels yet — run
+        <code>python3 tools/harness/label.py --in 'data/gate/*.jsonl' --rules
+        --out data/labels.csv</code></div>`;
+      return;
+    }
+    let h = `<div class="bar">`;
+    CLS.forEach((c, i) => {
+      const n = d.counts[['reversible','deferrable','compensable','irrevocable'][i]] || 0;
+      h += `<i style="width:${100*n/d.total}%;background:var(--${c})"></i>`;
+    });
+    h += `</div><div class="legend">`;
+    ['reversible','deferrable','compensable','irrevocable'].forEach((name, i) => {
+      const n = d.counts[name] || 0;
+      h += `<span><b style="color:var(--${CLS[i]})">${n}</b> ${name}
+        (${(100*n/d.total).toFixed(1)}%)</span>`;
+    });
+    h += `</div>`;
+
+    h += `<hr class="sep"><div class="note">which clause decided it</div>
+      <div class="kv" style="margin-top:6px">`;
+    Object.entries(d.rules).sort((a,b)=>b[1]-a[1]).forEach(([k,v]) => {
+      h += `<span class="k">${esc(k)}</span><span class="v">${v}</span>`;
+    });
+    h += `</div>`;
+
+    const def = d.counts['deferrable'] || 0, com = d.counts['compensable'] || 0;
+    if (def === 0 && com === 0) {
+      h += `<p class="note warn" style="margin-top:10px"><b>deferrable and
+        compensable are structurally 0, and that is correct.</b>
+        <code>deferrable</code> is a property of the <em>mechanism</em>
+        (taxonomy §5) and these traces were captured with strace, with nothing
+        running to hold a send. <code>compensable</code> requires a
+        <em>declared</em> registry entry (§2, Q5) and the registry is empty —
+        it never means “a compensation plausibly exists somewhere”.
+        <code>tests/p4/t04</code> asserts both rather than assuming them.</p>`;
+    }
+    h += `<p class="note" style="color:var(--dimmer)">These are the
+      <em>document's</em> labels — <code>docs/taxonomy.md</code> §2 made
+      executable. P4-05 is not complete until two people label independently and
+      the Cohen's kappa is reported; a kappa against this measures how well the
+      document is written, not how reliable the labels are.</p>`;
+    box.innerHTML = h;
+  } catch (e) {
+    box.innerHTML = `<div class="missing">${esc(e)}</div>`;
+  }
+}
+
+/* ============================================================
+ * Deferral + classifier counters
+ * ==========================================================*/
+function renderDefer() {
+  const box = $('defer');
+  if (!box) return;
+  const d = LIVE;
+  if (!d || !d.reachable) {
+    box.innerHTML = `<div class="missing">no link to the guest</div>`;
+    return;
+  }
+  const b = d.bpf || {};
+  let h = `<div class="kv">
+    <span class="k">BPF LSM active</span>
+      <span class="v" style="color:${b.lsm ? 'var(--rev)' : 'var(--irr)'}">${b.lsm ? 'yes' : 'no'}</span>
+    <span class="k">module BTF (kfuncs)</span>
+      <span class="v" style="color:${b.modbtf ? 'var(--rev)' : 'var(--irr)'}">${b.modbtf ? 'present' : 'absent'}</span>
+    <span class="k">WAL streaming</span>
+      <span class="v" style="color:${b.running ? 'var(--def)' : 'var(--dimmer)'}">${b.running ? 'yes' : 'no'}</span>
+  </div>`;
+  h += `<hr class="sep">
+    <p class="note">An LSM hook <b>cannot defer</b>.
+    <code>security_socket_sendmsg</code> returns allow-or-deny and has no third
+    answer. Deferral needs two interception points: the syscall reports success,
+    and the emission is suppressed downstream.</p>
+    <p class="note">It must be <code>tcx/egress</code>, not
+    <code>cgroup_skb/egress</code> — the latter drops the packet <em>and</em>
+    returns <code>-EPERM</code> to the sender, which defeats the point.
+    <code>TC_ACT_SHOT</code> becomes <code>-ENOBUFS</code>, which
+    <code>udp_sendmsg</code> swallows.</p>
+    <p class="note bad">That bounds the claim: the transparency is a property of
+    <b>datagram</b> semantics. A suppressed TCP send is retransmitted and
+    eventually errors the connection, so the rule table does not defer TCP.</p>
+    <p class="note" style="color:var(--dimmer)">Run
+    <code>src/bpf/txload --model data/model/model_tree_kernel.bin</code> in the
+    guest to see live counters and the classifier's decisions.</p>`;
+  box.innerHTML = h;
+}
+
+renderLabels();
+setInterval(() => { renderLabels(); renderDefer(); }, 6000);
