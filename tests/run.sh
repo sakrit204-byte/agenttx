@@ -115,6 +115,7 @@ run_test 2 tests/p3/t01_load.sh
 run_test 2 tests/p3/t03_gate.sh
 run_test 2 tests/p3/t06_wal.sh
 run_test 2 tests/p3/t07_defer.sh
+run_test 2 tests/p3/t08_flush.sh
 run_test 2 tests/p4/t07_infer.sh
 
 echo

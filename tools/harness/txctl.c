@@ -155,6 +155,62 @@ static int tx_setup_overlay(tx_id_t tx, const char *lower)
 	return 0;
 }
 
+#define TX_CTL_DIR	"/run/agenttx"
+
+/*
+ * Tell txload to flush or discard this transaction's deferred effects.
+ *
+ * ORDER: this runs AFTER TX_IOC_COMMIT, not before.
+ *
+ * The kernel commit sequence is fs-then-effects (src/core/commit.c): the
+ * undoable half first, the irreversible half last. Replaying the deferred
+ * packets IS the irreversible half, so it must not happen until the
+ * filesystem merge has succeeded. Doing it first would put packets on the
+ * wire for a transaction whose merge then failed -- exactly the partial
+ * commit the ordering exists to avoid.
+ *
+ * Waits for txload to acknowledge, so `txctl run` does not exit while its
+ * own effects are still in flight.
+ */
+static int tx_effects_finish(tx_id_t tx, int flush)
+{
+	char req[256], ack[256];
+	int fd, i;
+
+	snprintf(req, sizeof(req), "%s/%s-%llu", TX_CTL_DIR,
+		 flush ? "flush" : "discard", (unsigned long long)tx);
+	snprintf(ack, sizeof(ack), "%s/done-%llu", TX_CTL_DIR,
+		 (unsigned long long)tx);
+	unlink(ack);
+
+	fd = open(req, O_CREAT | O_WRONLY, 0600);
+	if (fd < 0) {
+		/*
+		 * No control directory means no txload, which means nothing
+		 * was ever deferred -- the LSM hooks are not attached. Not an
+		 * error: the ioctl path works perfectly well on its own.
+		 */
+		return 0;
+	}
+	close(fd);
+
+	for (i = 0; i < 100; i++) {		/* up to ~5s */
+		if (access(ack, F_OK) == 0) {
+			unlink(ack);
+			printf("tx=%llu deferred effects %s\n",
+			       (unsigned long long)tx,
+			       flush ? "replayed" : "discarded");
+			return 0;
+		}
+		usleep(50000);
+	}
+	fprintf(stderr,
+		"txctl: txload did not acknowledge the %s for tx=%llu.\n"
+		"       Deferred packets may still be suppressed.\n",
+		flush ? "flush" : "discard", (unsigned long long)tx);
+	return -1;
+}
+
 static const char *const class_names[] = TX_CLASS_NAMES;
 static const char *const state_names[] = TX_STATE_NAMES;
 
@@ -422,6 +478,11 @@ static int cmd_run(int fd, __u32 flags, __u32 timeout_ms,
 		printf("tx=%llu verification PASSED -> commit\n",
 		       (unsigned long long)tx);
 		verified = do_end(fd, 1, tx, TX_REASON_VERIFIED, 0) == 0;
+		/* Only replay if the commit itself succeeded. */
+		if (verified)
+			tx_effects_finish(tx, 1);
+		else
+			tx_effects_finish(tx, 0);
 	} else {
 		if (WIFSIGNALED(status))
 			printf("tx=%llu child killed by signal %d -> abort\n",
@@ -430,6 +491,7 @@ static int cmd_run(int fd, __u32 flags, __u32 timeout_ms,
 			printf("tx=%llu verification FAILED (exit %d) -> abort\n",
 			       (unsigned long long)tx, WEXITSTATUS(status));
 		do_end(fd, 0, tx, TX_REASON_VERIFY_FAIL, 0);
+		tx_effects_finish(tx, 0);
 	}
 
 	/* Release the holder now that the transaction has been decided. */

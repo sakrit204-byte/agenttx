@@ -34,12 +34,220 @@
 #include <string.h>
 #include <fcntl.h>
 #include <net/if.h>
+#include <arpa/inet.h>
+#include <dirent.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <netinet/in.h>
 #include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "agenttx.h"
 #include "agenttx.skel.h"
+
+/* ------------------------------------------------------------------ */
+/* P3-09: flush on commit, discard on abort.                           */
+/* ------------------------------------------------------------------ */
+/*
+ * WHY REPLAY IS IN USERSPACE.
+ *
+ * Two reasons, and neither is convenience. The suppression state lives in
+ * BPF maps, which are managed from userspace; and transmitting a captured
+ * datagram from kernel context would mean building sk_buffs by hand for no
+ * benefit over a socket. The supervisor is already the process that decides
+ * to commit, and it is the natural place to make the decision real.
+ *
+ * THE ORDERING THAT MATTERS.
+ *
+ * Suppression must be cleared BEFORE the replay is sent. Our own egress
+ * program keys deferred UDP on (daddr, dport, proto) -- the destination-only
+ * fallback -- so a replay from a fresh socket matches it just as well as the
+ * original did. Replaying first would mean the commit path emitted a packet
+ * and then dropped it with its own rule, and commit would silently be a
+ * no-op that reported success. Clear, then send.
+ */
+#define TX_CTL_DIR	"/run/agenttx"
+
+struct deferred {
+	struct deferred *next;
+	struct tx_wal_rec rec;
+};
+
+static struct deferred *deferred_head;
+static unsigned long long n_deferred_held;
+
+static void defer_remember(const struct tx_wal_rec *r)
+{
+	struct deferred *d = calloc(1, sizeof(*d));
+
+	if (!d)
+		return;
+	d->rec = *r;
+	d->next = deferred_head;
+	deferred_head = d;
+	n_deferred_held++;
+}
+
+/* Remove every defer-map entry belonging to @tx. */
+static int defer_clear(struct agenttx_bpf *skel, __u64 tx)
+{
+	int removed = 0;
+	int fds[2] = { bpf_map__fd(skel->maps.tx_defer_flows),
+		       bpf_map__fd(skel->maps.tx_defer_dests) };
+	size_t ksz[2] = { bpf_map__key_size(skel->maps.tx_defer_flows),
+			  bpf_map__key_size(skel->maps.tx_defer_dests) };
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		unsigned char key[64] = {}, next[64] = {};
+		int have = 0;
+		__u64 val = 0;
+
+		if (fds[i] < 0 || ksz[i] > sizeof(key))
+			continue;
+		while (bpf_map_get_next_key(fds[i], have ? key : NULL, next) == 0) {
+			memcpy(key, next, ksz[i]);
+			have = 1;
+			if (bpf_map_lookup_elem(fds[i], key, &val) == 0 && val == tx) {
+				if (bpf_map_delete_elem(fds[i], key) == 0)
+					removed++;
+				/* Deleting invalidates iteration position on
+				 * some map types; restart to be safe. */
+				have = 0;
+			}
+		}
+	}
+	return removed;
+}
+
+/*
+ * Send one captured datagram again, from a fresh socket.
+ *
+ * The source port will differ from the original -- the socket is new -- and
+ * that is correct: a fire-and-forget datagram carries no reply the peer
+ * could route back. It is also why clearing the destination-only key first
+ * is mandatory rather than tidy.
+ */
+static int replay_one(const struct tx_wal_rec *r)
+{
+	struct sockaddr_in to = {};
+	int fd, rc;
+
+	if (r->payload_len == 0)
+		return -1;			/* nothing captured to replay */
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return -1;
+	to.sin_family = AF_INET;
+	to.sin_port = htons(r->dport);
+	to.sin_addr.s_addr = r->daddr_v4;
+
+	rc = sendto(fd, r->payload, r->payload_len, 0,
+		    (struct sockaddr *)&to, sizeof(to));
+	close(fd);
+	return rc < 0 ? -1 : 0;
+}
+
+static int cmp_seq(const void *a, const void *b)
+{
+	const struct tx_wal_rec *x = *(const struct tx_wal_rec **)a;
+	const struct tx_wal_rec *y = *(const struct tx_wal_rec **)b;
+
+	return x->seq < y->seq ? -1 : x->seq > y->seq;
+}
+
+/*
+ * @flush: replay in seq order, then forget. Otherwise: forget.
+ *
+ * Replay order is the contract's, not ours: include/agenttx.h says seq is
+ * "per-tx and gap-free" and "defines replay order". An agent that wrote a
+ * log line before a notification meant them in that order, and a commit that
+ * reorders them has changed what the transaction did.
+ */
+static int defer_finish(struct agenttx_bpf *skel, __u64 tx, int flush)
+{
+	struct deferred **keep = &deferred_head, *d;
+	struct tx_wal_rec **batch = NULL;
+	int n = 0, cap = 0, sent = 0, i;
+
+	/* Clear suppression FIRST. See the comment at the top of this block. */
+	int cleared = defer_clear(skel, tx);
+
+	while ((d = *keep)) {
+		if (d->rec.tx_id != tx) {
+			keep = &d->next;
+			continue;
+		}
+		*keep = d->next;
+		if (flush) {
+			if (n == cap) {
+				cap = cap ? cap * 2 : 16;
+				batch = realloc(batch, cap * sizeof(*batch));
+				if (!batch)
+					break;
+			}
+			batch[n++] = &d->rec;
+		} else {
+			free(d);
+		}
+		if (n_deferred_held)
+			n_deferred_held--;
+	}
+
+	if (flush && n) {
+		qsort(batch, n, sizeof(*batch), cmp_seq);
+		for (i = 0; i < n; i++)
+			if (replay_one(batch[i]) == 0)
+				sent++;
+	}
+	free(batch);
+
+	printf("txload: tx=%llu %s -- %d suppression entr%s cleared, "
+	       "%d of %d effect(s) %s\n",
+	       (unsigned long long)tx, flush ? "FLUSH" : "DISCARD",
+	       cleared, cleared == 1 ? "y" : "ies",
+	       flush ? sent : 0, n, flush ? "replayed" : "discarded");
+	return flush ? sent : n;
+}
+
+/*
+ * Control channel: a file per request under /run/agenttx.
+ *
+ * Deliberately the dumbest thing that works. The supervisor is a different
+ * process (txctl), the maps are not pinned yet, and a socket protocol here
+ * would be a second thing to debug when the first one breaks. When the maps
+ * are pinned to TX_PIN_DIR the supervisor can do this itself and the channel
+ * disappears entirely.
+ */
+static void poll_control(struct agenttx_bpf *skel)
+{
+	DIR *dir = opendir(TX_CTL_DIR);
+	struct dirent *e;
+	char path[512];
+
+	if (!dir)
+		return;
+	while ((e = readdir(dir))) {
+		unsigned long long tx = 0;
+		int flush = -1;
+
+		if (sscanf(e->d_name, "flush-%llu", &tx) == 1)
+			flush = 1;
+		else if (sscanf(e->d_name, "discard-%llu", &tx) == 1)
+			flush = 0;
+		if (flush < 0)
+			continue;
+
+		defer_finish(skel, (__u64)tx, flush);
+		snprintf(path, sizeof(path), "%s/%s", TX_CTL_DIR, e->d_name);
+		unlink(path);
+		snprintf(path, sizeof(path), "%s/done-%llu", TX_CTL_DIR, tx);
+		close(open(path, O_CREAT | O_WRONLY, 0600));
+	}
+	closedir(dir);
+}
 
 static volatile sig_atomic_t stop;
 static FILE *jsonl;
@@ -110,6 +318,10 @@ static int on_record(void *ctx, void *data, size_t len)
 	if (len < sizeof(*r))
 		return 0;
 	n_records++;
+
+	/* Hold on to anything the hook deferred: commit has to replay it. */
+	if (r->verdict == TX_V_DEFERRED)
+		defer_remember(r);
 
 	printf("  seq=%-4llu tx=%-3llu %-15s %-12s %-10s",
 	       (unsigned long long)r->seq, (unsigned long long)r->tx_id,
@@ -327,12 +539,16 @@ int main(int argc, char **argv)
 
 	signal(SIGINT, on_sig);
 	signal(SIGTERM, on_sig);
-	printf("txload: streaming the WAL. Ctrl-C to stop.\n\n");
+	mkdir(TX_CTL_DIR, 0700);
+	printf("txload: streaming the WAL. Ctrl-C to stop.\n");
+	printf("        commit/abort control via %s/{flush,discard}-<txid>\n\n",
+	       TX_CTL_DIR);
 
 	while (!stop) {
 		err = ring_buffer__poll(rb, 1000);
 		if (err == -EINTR) { err = 0; break; }
 		if (err < 0) { fprintf(stderr, "txload: poll: %d\n", err); break; }
+		poll_control(skel);
 		if (stats)
 			print_stats(skel);
 	}
