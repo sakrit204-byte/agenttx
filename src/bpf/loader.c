@@ -44,6 +44,7 @@
 #include <unistd.h>
 
 #include "agenttx.h"
+#include "infer.h"
 #include "agenttx.skel.h"
 
 /* ------------------------------------------------------------------ */
@@ -369,14 +370,15 @@ static void print_stats(struct agenttx_bpf *skel)
 	static const char *const names[] = {
 		"syscalls seen", "inside a tx", "WAL records", "DROPPED (ring full)",
 		"DEFERRED (held back)", "SUPPRESSED (packets dropped)",
-		"egress program ran", "egress saw AF_INET"
+		"egress program ran", "egress saw AF_INET",
+		"classified by the MODEL", "classified by RULES"
 	};
 	int fd = bpf_map__fd(skel->maps.tx_stats);
 	__u32 k;
 	__u64 v;
 
 	printf("\n  counters\n");
-	for (k = 0; k < 8; k++) {
+	for (k = 0; k < 10; k++) {
 		v = 0;
 		bpf_map_lookup_elem(fd, &k, &v);
 		printf("    %-30s %llu%s\n", names[k], (unsigned long long)v,
@@ -392,7 +394,7 @@ int main(int argc, char **argv)
 	struct bpf_link *tcx_links[8] = {};
 	int n_links = 0;
 	int once = 0, stats = 0, err, i;
-	const char *jpath = NULL;
+	const char *jpath = NULL, *mpath = NULL;
 	int defer_ports[16], n_defer = 0;
 
 	for (i = 1; i < argc; i++) {
@@ -400,12 +402,13 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--stats"))  stats = 1;
 		else if (!strcmp(argv[i], "--jsonl") && i + 1 < argc) jpath = argv[++i];
 
+		else if (!strcmp(argv[i], "--model") && i + 1 < argc) mpath = argv[++i];
 		else if (!strcmp(argv[i], "--defer-port") && i + 1 < argc &&
 			 n_defer < 16) defer_ports[n_defer++] = atoi(argv[++i]);
 		else {
 			fprintf(stderr,
 				"usage: txload [--once] [--stats] [--jsonl F]\n"
-				"              [--defer-port N]...\n");
+				"              [--model FILE] [--defer-port N]...\n");
 			return 2;
 		}
 	}
@@ -450,6 +453,82 @@ int main(int argc, char **argv)
 			"        the one running -- regenerate it after every\n"
 			"        `make vm-kernel`.\n");
 		return 1;
+	}
+
+	/*
+	 * Load the model (P4-10 / P3-11).
+	 *
+	 * Validated HERE rather than in the hook. The BPF side can only fail
+	 * closed -- every effect becomes irrevocable and everything escalates
+	 * -- which is safe and tells you nothing. A bad blob should be a
+	 * refusal at load time with a reason, not a system that silently
+	 * escalates forever.
+	 */
+	if (mpath) {
+		struct tx_model_tree m = {};
+		FILE *mf = fopen(mpath, "rb");
+		size_t got;
+		__u32 zero = 0;
+
+		if (!mf) {
+			fprintf(stderr, "txload: cannot open model %s: %s\n",
+				mpath, strerror(errno));
+			err = 1;
+			goto out;
+		}
+		got = fread(&m, 1, sizeof(m), mf);
+		fclose(mf);
+
+		if (got != sizeof(m)) {
+			fprintf(stderr,
+				"txload: %s is %zu bytes, expected %zu "
+				"(sizeof(struct tx_model_tree))\n",
+				mpath, got, sizeof(m));
+			err = 1;
+			goto out;
+		}
+		if (m.hdr.magic != TX_MODEL_MAGIC) {
+			fprintf(stderr, "txload: %s has magic 0x%08x, expected 0x%08x\n",
+				mpath, m.hdr.magic, TX_MODEL_MAGIC);
+			err = 1;
+			goto out;
+		}
+		if (m.hdr.abi != AGENTTX_ABI_VERSION) {
+			fprintf(stderr,
+				"txload: model abi %u, this loader expects %u -- "
+				"re-export with `make weights`\n",
+				m.hdr.abi, AGENTTX_ABI_VERSION);
+			err = 1;
+			goto out;
+		}
+		if (m.hdr.kind != TX_MODEL_TREE) {
+			fprintf(stderr, "txload: model kind %u is not a tree\n", m.hdr.kind);
+			err = 1;
+			goto out;
+		}
+		if (m.hdr.n_features != TX_N_FEATURES ||
+		    m.hdr.n_classes != TX_CLASS_MAX) {
+			fprintf(stderr,
+				"txload: model shape %u features / %u classes, "
+				"contract says %u / %u\n",
+				m.hdr.n_features, m.hdr.n_classes,
+				TX_N_FEATURES, TX_CLASS_MAX);
+			err = 1;
+			goto out;
+		}
+		if (bpf_map_update_elem(bpf_map__fd(skel->maps.tx_model),
+					&zero, &m, BPF_ANY)) {
+			fprintf(stderr, "txload: cannot write the model map: %s\n",
+				strerror(errno));
+			err = 1;
+			goto out;
+		}
+		printf("txload: model loaded -- %u nodes, trained on %u rows, "
+		       "held-out %u.%02u%%\n",
+		       m.hdr.n_nodes, m.hdr.trained_rows,
+		       m.hdr.accuracy_pct / 100, m.hdr.accuracy_pct % 100);
+	} else {
+		printf("txload: no model (--model) -- using the static rule table\n");
 	}
 
 	/* Operator overrides for the static rule table (P3-06). */

@@ -28,11 +28,11 @@ ARCH       := x86
 REPO       := ../..
 
 BPF_CFLAGS := -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) -D__TX_BPF__ \
-              -I. -I$(REPO)/include -Wall -Wno-unused-function
+              -I. -I$(REPO)/include -I$(REPO)/src/policy -Wall -Wno-unused-function
 
 # Userspace loader.  Links libbpf dynamically so the same binary runs in the
 # guest, which has the runtime but no headers and no compiler.
-LOADER_CFLAGS := -g -O2 -Wall -Wextra -I. -I$(REPO)/include
+LOADER_CFLAGS := -g -O2 -Wall -Wextra -I. -I$(REPO)/include -I$(REPO)/src/policy -I$(REPO)/src/policy
 LOADER_LDLIBS := -lbpf -lelf -lz
 
 BPF_SRCS := agenttx.bpf.c

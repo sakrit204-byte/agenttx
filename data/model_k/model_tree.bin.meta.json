@@ -1,0 +1,18 @@
+{
+  "abi": 1,
+  "accuracy_pct": 4954,
+  "bad_nodes": 0,
+  "file_bytes": 3096,
+  "fnv_nodes": 4850541681043065823,
+  "kind": 1,
+  "leaves": 12,
+  "magic": "0x54584d44",
+  "n_classes": 4,
+  "n_features": 16,
+  "n_nodes": 23,
+  "sizeof_hdr": 24,
+  "sizeof_mlp": 812,
+  "sizeof_node": 6,
+  "sizeof_tree": 3096,
+  "trained_rows": 15001
+}

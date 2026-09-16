@@ -1,0 +1,91 @@
+{
+  "n_train": 15001,
+  "n_test": 5001,
+  "seed": 1,
+  "models": {
+    "tree": {
+      "accuracy": 0.9550089982003599,
+      "balanced_accuracy": 0.4954431175361408,
+      "irrevocable_recall": 1.0,
+      "irrevocable_missed": 0,
+      "escalation_rate": 0.0629874025194961,
+      "confusion_matrix": [
+        [
+          4686,
+          0,
+          0,
+          87
+        ],
+        [
+          0,
+          0,
+          0,
+          90
+        ],
+        [
+          0,
+          0,
+          0,
+          48
+        ],
+        [
+          0,
+          0,
+          0,
+          90
+        ]
+      ]
+    },
+    "mlp": {
+      "accuracy": 0.9500099980003999,
+      "balanced_accuracy": 0.4941336685522732,
+      "irrevocable_recall": 1.0,
+      "irrevocable_missed": 0,
+      "escalation_rate": 0.06798640271945611,
+      "confusion_matrix": [
+        [
+          4661,
+          0,
+          0,
+          112
+        ],
+        [
+          0,
+          0,
+          0,
+          90
+        ],
+        [
+          0,
+          0,
+          0,
+          48
+        ],
+        [
+          0,
+          0,
+          0,
+          90
+        ]
+      ]
+    }
+  },
+  "feature_importance": {
+    "dport_lo": 0.42403371834897924,
+    "path_hash_b1": 0.30380228875643867,
+    "hook_id": 0.15815939490200484,
+    "msg_flags": 0.07049962705605083,
+    "open_flags": 0.038930395588014616,
+    "is_loopback": 0.0045745753485091556,
+    "path_hash_b0": 2.7505853135430055e-15,
+    "syscall_nr": 0.0,
+    "path_depth": 0.0,
+    "path_is_dot": 0.0,
+    "fd_type": 0.0,
+    "dport_hi": 0.0,
+    "af": 0.0,
+    "tx_depth": 0.0,
+    "ngram_0": 0.0,
+    "ngram_1": 0.0
+  }
+}

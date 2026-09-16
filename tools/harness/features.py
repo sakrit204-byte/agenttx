@@ -79,8 +79,19 @@ FD_TYPE = {"none": 0, "fifo": 1, "chr": 2, "dir": 4, "blk": 6,
 
 AF = {None: 0, "AF_UNIX": 1, "AF_INET": 2, "AF_INET6": 10}
 
-# Packed into one byte.  The hook has these as bits of `flags` already, so
-# this is a mask, not a parse.
+# Packed into one byte.  THIS IS *NOT* THE KERNEL'S BIT LAYOUT.
+#
+# An earlier comment here said "the hook has these as bits of `flags`
+# already, so this is a mask, not a parse".  That is wrong and it is the
+# dangerous kind of wrong.  Measured: 6 of these 8 differ from the kernel
+# (O_CREAT 0x40 vs 0x04, O_TRUNC 0x200 vs 0x08, O_APPEND 0x400 vs 0x10,
+# O_EXCL 0x80 vs 0x20, O_NOFOLLOW 0x20000 vs 0x40).  A hook that masked the
+# raw kernel value would produce a different feature than this function does
+# for the same open, and nothing would fail -- the model would simply train
+# on one encoding and run on another.
+#
+# src/policy/features.h does the remap explicitly, and tests/p4/t07_infer.sh
+# compares the two implementations on real records.
 OPEN_BIT = {"O_RDONLY": 0x00, "O_WRONLY": 0x01, "O_RDWR": 0x02,
             "O_CREAT": 0x04, "O_TRUNC": 0x08, "O_APPEND": 0x10,
             "O_EXCL": 0x20, "O_NOFOLLOW": 0x40}
@@ -88,6 +99,11 @@ OPEN_BIT = {"O_RDONLY": 0x00, "O_WRONLY": 0x01, "O_RDWR": 0x02,
 # MSG_DONTWAIT is the cheap fire-and-forget signal.  Present because it is
 # real and computable; weighted-on with caution because an injection can
 # simply not set it.  P4-13 tests exactly that evasion.
+#
+# ALSO NOT THE KERNEL'S LAYOUT.  Kernel MSG_DONTWAIT is 0x40, which is this
+# table's MSG_CONFIRM.  A hook masking raw kernel flags would therefore
+# report MSG_CONFIRM on exactly the sends that set the fire-and-forget
+# signal -- the single most load-bearing feature, silently inverted.
 MSG_BIT = {"MSG_OOB": 0x01, "MSG_PEEK": 0x02, "MSG_DONTROUTE": 0x04,
            "MSG_DONTWAIT": 0x08, "MSG_MORE": 0x10, "MSG_NOSIGNAL": 0x20,
            "MSG_CONFIRM": 0x40, "MSG_EOR": 0x80}
@@ -102,6 +118,30 @@ def fnv1a64(s: str) -> int:
 
 def clamp8(v: int) -> int:
     return 0 if v < 0 else (255 if v > 255 else v)
+
+
+# ---------------------------------------------------------------------------
+# Features an in-kernel LSM hook CANNOT supply with a value that matches what
+# this function computes for the same event.
+#
+# This is not a performance concern, it is a correctness one. A model trained
+# on a feature the hook feeds a constant 0 does not degrade gracefully -- it
+# walks a fixed path through the zeros and returns whatever leaf is at the
+# end. Measured on our first tree: 33 of 60 internal nodes (55%) split on
+# these three, and every real send classified `reversible`.
+#
+#   syscall_nr   LSM hooks run below syscall dispatch. The number is not in
+#                scope, and there is no cheap way to recover it.
+#   ngram_0/1    needs per-task syscall history, which the hook does not keep
+#                -- and worse, this function hashes syscall NAME STRINGS.
+#                Even with history, a kernel-side hash of hook ids would be a
+#                different number, so the thresholds would be meaningless.
+#                Not "missing": unmatchable.
+#
+# Everything else matches: path_* and open_flags are legitimately 0 for a
+# socket send in both the trace and the hook, fd_type is S_IFSOCK>>12 in both,
+# and msg_flags matches once src/policy/tx_features.h applies the remap.
+KERNEL_BLIND = [F_SYSCALL_NR, F_NGRAM_0, F_NGRAM_1]
 
 
 def extract(rec: dict) -> list[int]:
@@ -164,11 +204,21 @@ def extract(rec: dict) -> list[int]:
     return f
 
 
+def blind(f: list[int]) -> list[int]:
+    """Zero the features the hook cannot match.  See KERNEL_BLIND."""
+    for i in KERNEL_BLIND:
+        f[i] = 0
+    return f
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--in", dest="inp", required=True, help="trace .jsonl")
     ap.add_argument("--out", required=True, help="output .npz")
+    ap.add_argument("--kernel-only", action="store_true",
+                    help="zero the features an LSM hook cannot supply, so the "
+                         "model cannot learn to depend on them (see below)")
     ap.add_argument("--exclude-synth", action="store_true",
                     help="drop label_source=synth rows. Use this the moment "
                          "real labelled traces exist -- synthetic labels are "
@@ -207,7 +257,10 @@ def main(argv=None) -> int:
                       file=sys.stderr)
                 return 1
 
-            X.append(extract(rec))
+            v = extract(rec)
+            if a.kernel_only:
+                v = blind(v)
+            X.append(v)
             y.append(CLASS_ID[lab])
             # Carried alongside, not as a feature: awaits_reply is derived
             # from what happened *after* the syscall, so the hook cannot

@@ -93,6 +93,7 @@ run_test 0 tools/vm/headers-check.sh
 run_test 0 tests/p4/t01_gate.sh
 run_test 0 tests/p4/t06_weights.sh
 run_test 0 tests/p4/t06_sabotage.sh
+run_test 0 tests/p4/t07_infer.sh
 run_test 0 tests/p4/t08_deadlock.sh
 
 # --- tier 1: module loaded in the guest -------------------------------
@@ -116,7 +117,7 @@ run_test 2 tests/p3/t03_gate.sh
 run_test 2 tests/p3/t06_wal.sh
 run_test 2 tests/p3/t07_defer.sh
 run_test 2 tests/p3/t08_flush.sh
-run_test 2 tests/p4/t07_infer.sh
+
 
 echo
 printf '  %d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skip"

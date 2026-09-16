@@ -27,6 +27,7 @@
 #   make train         train the float baseline classifier            (P4-07)
 #   make quantize      int8 quantise and report the accuracy delta    (P4-08)
 #   make weights       export the BPF model blob                      (P4-09)
+#   make model-kernel  train+export the model the KERNEL runs        (P4-10)
 #   make pipeline      synth -> train -> quantize -> weights, end to end
 #   make bench         run every bench_*.sh into results/             (P4-11)
 #   make vm-kernel     build the guest kernel                         (P*-00)
@@ -110,8 +111,15 @@ txctl: tools/harness/txctl
 tools/harness/txctl: tools/harness/txctl.c include/agenttx.h
 	$(CC) -Wall -Wextra -Werror -I include -o $@ $<
 
+# The hook's feature encoder, compiled for userspace so the cross-check test
+# can compare it against features.py.  Same header, two compilations.
+.PHONY: featcheck
+featcheck: tools/harness/featcheck
+tools/harness/featcheck: tools/harness/featcheck.c src/policy/tx_features.h include/agenttx.h
+	$(CC) -Wall -Wextra -Werror -I include -I src/policy -o $@ $<
+
 .PHONY: test-stub
-test-stub: txctl
+test-stub: txctl featcheck
 	$(MAKE) STUB=1 module
 	@bash tests/run.sh --stub
 
@@ -161,6 +169,24 @@ train: features
 quantize:
 	$(PY) tools/harness/quantize.py --model $(DATA)/model \
 		--features $(DATA)/traces/features.npz --out $(DATA)/model
+
+# The model the KERNEL actually runs.
+#
+# Trained with --kernel-only, which zeroes the features an LSM hook cannot
+# supply (syscall_nr, ngram_0, ngram_1) so the tree cannot learn to depend on
+# them. Without this the tree put 55% of its decision nodes on features the
+# hook feeds a constant 0, and every real send classified `reversible`.
+.PHONY: model-kernel
+model-kernel:
+	$(PY) tools/harness/features.py --in $(DATA)/traces/synth.jsonl \
+		--out $(DATA)/traces/features_kernel.npz --kernel-only
+	$(PY) tools/harness/train.py --in $(DATA)/traces/features_kernel.npz \
+		--out $(DATA)/model_kernel
+	$(PY) tools/harness/export_weights.py --model $(DATA)/model_kernel \
+		--kind tree --out $(DATA)/model/model_tree_kernel.bin
+	@echo
+	@echo "kernel model -> $(DATA)/model/model_tree_kernel.bin"
+	@echo "load with: txload --model data/model/model_tree_kernel.bin"
 
 .PHONY: weights
 weights:

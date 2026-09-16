@@ -31,6 +31,8 @@
 #include <bpf/bpf_endian.h>
 
 #include "agenttx.h"
+#include "tx_features.h"
+#include "infer.h"
 
 /*
  * vmlinux.h carries every TYPE the kernel knows and none of its #defines --
@@ -177,6 +179,23 @@ struct {
 	__type(value, __u8);		/* enum tx_class */
 } tx_rules SEC(".maps");
 
+/*
+ * The model (P4-10). One array slot holding the whole blob; the loader
+ * writes it from data/model/model_tree.bin.
+ *
+ * An EMPTY slot is not an error. The magic check inside tx_tree_classify()
+ * fails, which returns TX_IRREVOCABLE, which would escalate every effect --
+ * safe, but useless. So the hook checks whether a model is loaded and falls
+ * back to the static rule table (P3-06) when it is not. That keeps "no model
+ * yet" and "model says irrevocable" as different states rather than one.
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct tx_model_tree);
+} tx_model SEC(".maps");
+
 /* Observability that survives a full ring: counters never drop. */
 enum {
 	TX_STAT_SEEN = 0,
@@ -187,6 +206,8 @@ enum {
 	TX_STAT_SUPPRESSED,	/* packets the egress program actually dropped */
 	TX_STAT_EGRESS_SEEN,	/* diagnostic: did the egress program run at all */
 	TX_STAT_EGRESS_INET,	/* diagnostic: ...and did it see an AF_INET skb */
+	TX_STAT_MODEL,		/* classified by the in-kernel model            */
+	TX_STAT_RULES,		/* classified by the static rule table          */
 	TX_STAT_MAX,
 };
 
@@ -602,7 +623,54 @@ int BPF_PROG(tx_socket_sendmsg, struct socket *sock, struct msghdr *msg,
 		}
 	}
 
-	klass = classify(daddr, dport, proto, mflags, &conf);
+	/*
+	 * P3-11: the model replaces the static rules, and the swap is this
+	 * small because both go through the same funnel. If landing the
+	 * classifier had needed changes elsewhere in this hook, the contract
+	 * between P3 and P4 was drawn wrong.
+	 */
+	{
+		__u32 zero = 0;
+		struct tx_model_tree *m = bpf_map_lookup_elem(&tx_model, &zero);
+		__u32 k = dport;
+		__u8 *override = bpf_map_lookup_elem(&tx_rules, &k);
+
+		if (override) {
+			/* The compensable registry is shipped, not learned
+			 * (PROPOSAL.md). An operator override outranks the
+			 * model by design. */
+			klass = *override;
+			conf = 255;
+			bump(TX_STAT_RULES);
+		} else if (m && m->hdr.magic == TX_MODEL_MAGIC) {
+			struct tx_feat_in fi = {};
+			struct tx_features fv;
+
+			/*
+			 * NOT the syscall number -- an LSM hook runs below
+			 * syscall dispatch and cannot see it. An earlier
+			 * version passed `size` here, which fed the message
+			 * byte count into a feature trained on syscall
+			 * numbers. Left at 0, and the model is trained with
+			 * --kernel-only so it cannot split on it.
+			 */
+			fi.syscall_nr	     = 0;
+			fi.hook		     = TX_HOOK_SOCKET_SENDMSG;
+			fi.dport	     = dport;
+			fi.family	     = family;
+			fi.is_loopback	     = ((daddr & 0xff) == 127);
+			fi.in_tx	     = 1;
+			fi.fd_type	     = 12;	/* S_IFSOCK >> 12 */
+			fi.msg_flags_kernel  = mflags;
+
+			tx_features_extract(&fi, &fv);
+			klass = (__u8)tx_tree_classify(m, &fv, &conf);
+			bump(TX_STAT_MODEL);
+		} else {
+			klass = classify(daddr, dport, proto, mflags, &conf);
+			bump(TX_STAT_RULES);
+		}
+	}
 
 	/*
 	 * The fail-closed rule, applied exactly as tx_class_final() applies
