@@ -149,17 +149,54 @@ def main(argv=None) -> int:
     # the per-syscall fraction counts one effect many times.  This is the
     # second, coarser unit, and both are reported.  See docs/journal/p4.md.
     conn_stats: dict[tuple, dict] = {}
+    # Ordered event list per connection, for the THIRD unit (see below).
+    conn_events: dict[tuple, list] = {}
 
-    n_lines = n_parsed = 0
+    n_lines = n_parsed = n_stitched = n_signal = 0
+    pending_unfin: dict[int, str] = {}
     with open(a.strace, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             n_lines += 1
             line = line.rstrip("\n")
-            if UNFINISHED.match(line) or RESUMED.search(line):
-                # Interleaved multi-threaded output. Skipping these slightly
-                # undercounts; it never invents a fire-and-forget, which is
-                # the direction an honest error should go.
+            # --- stitch <unfinished ...> / <... resumed> -------------
+            #
+            # strace splits a syscall across two lines when another thread
+            # runs in between:
+            #
+            #   1234 12:00:00.1 sendto(3<TCP:[...]>, "x"..., 64, 0 <unfinished ...>
+            #   1234 12:00:00.2 <... sendto resumed>)             = 64
+            #
+            # The first carries the arguments, the second the return value.
+            # Discarding both threw away 34-66% of these traces, and not
+            # neutrally: a dropped INBOUND op is a reply we never saw, so its
+            # send looks unanswered and fire-and-forget is inflated. On the
+            # first four captures that was 1571 inbound ops silently
+            # counted in our own favour.
+            #
+            # Every unfinished call in these traces has its resumption, so
+            # stitching is exact rather than heuristic.
+            if " --- SIG" in line or "+++" in line:
+                n_signal += 1
                 continue
+
+            um = UNFINISHED.match(line)
+            if um:
+                pid_u = int(um.group("pid"))
+                head = line.split("<unfinished", 1)[0]
+                pending_unfin[pid_u] = head
+                continue
+
+            rm = RESUMED.search(line)
+            if rm:
+                pid_r = int(rm.group("pid"))
+                head = pending_unfin.pop(pid_r, None)
+                if head is None:
+                    continue          # resumption without its opening half
+                tail = line.split("resumed>", 1)[1]
+                # The opening half ends mid-argument-list; the closing half
+                # supplies the rest and the return value.
+                line = head.rstrip() + tail
+                n_stitched += 1
             mo = LINE.match(line)
             if not mo:
                 continue
@@ -188,6 +225,7 @@ def main(argv=None) -> int:
                     (pid, annot), {"out": 0, "in": 0, "obytes": 0, "ibytes": 0})
                 cs["out"] += 1
                 cs["obytes"] += int(ret)
+                conn_events.setdefault((pid, annot), []).append(("out", ts))
 
                 idx = len(sends)
                 dip, dport = peer_addr(annot)
@@ -220,6 +258,7 @@ def main(argv=None) -> int:
                             {"out": 0, "in": 0, "obytes": 0, "ibytes": 0})
                         cs["in"] += 1
                         cs["ibytes"] += int(ret)
+                        conn_events.setdefault((pid, annot), []).append(("in", ts))
                 lst = pending.get((pid, fd))
                 if not lst:
                     continue
@@ -260,7 +299,30 @@ def main(argv=None) -> int:
     print("=" * 62)
     print("AgentTx project gate -- fire-and-forget fraction")
     print("=" * 62)
-    print("  parsed %d of %d strace lines" % (n_parsed, n_lines))
+    # Account for EVERY line. A percentage that does not add to 100 is a
+    # place something could be hiding, and on this measurement the thing
+    # that was hiding was 1571 inbound ops whose absence inflated the
+    # headline in our own favour.
+    # n_parsed counts SYSCALLS, and a stitched syscall consumed two lines
+    # while a direct one consumed one. Subtracting n_parsed and the stitched
+    # line count both would double-count the stitched half -- which it did,
+    # and the accounting reported a negative remainder. That is the accounting
+    # doing its job.
+    n_unfin_lines = n_stitched * 2
+    n_direct_lines = n_parsed - n_stitched
+    n_other = n_lines - n_direct_lines - n_unfin_lines - n_signal
+    print("  line accounting for %d strace lines:" % n_lines)
+    print("    parsed directly      %7d   %5.1f%%" % (n_direct_lines,
+          100.0 * n_direct_lines / n_lines if n_lines else 0))
+    print("    stitched pairs       %7d   %5.1f%%   (%d syscalls)"
+          % (n_unfin_lines, 100.0 * n_unfin_lines / n_lines if n_lines else 0,
+             n_stitched))
+    print("    signals / exits      %7d   %5.1f%%   (not syscalls)"
+          % (n_signal, 100.0 * n_signal / n_lines if n_lines else 0))
+    print("    UNACCOUNTED          %7d   %5.1f%%%s"
+          % (n_other, 100.0 * n_other / n_lines if n_lines else 0,
+             "   <- investigate before trusting any figure below" if n_other > n_lines * 0.01 else ""))
+    print("  syscalls recovered: %d" % n_parsed)
     print("  outbound socket operations: %d" % total)
     print()
     print("  fire-and-forget    %6d   %5.1f%%   <- deferrable" % (ff, pct_ff))
@@ -303,6 +365,61 @@ def main(argv=None) -> int:
     ops_on_ff = sum(v["out"] for v in conns_out.values() if v["in"] == 0)
     pct_ops_ff = 100.0 * ops_on_ff / total if total else 0.0
 
+    # ---------------------------------------------------------------
+    # THE THIRD UNIT -- per LOGICAL REQUEST.
+    #
+    # Per-syscall is too generous: TLS fragments one request across many
+    # sendto() calls. Per-connection is too harsh: a persistent connection
+    # carrying a blocking request AND a fire-and-forget ping counts entirely
+    # as request-response. The unit that actually matches "one effect" is
+    # the logical request, and it is computable without parsing TLS:
+    #
+    #   A logical request is a maximal run of outbound writes on one
+    #   connection, uninterrupted by an inbound read on that connection.
+    #   It is request-response if a read follows it on that connection, and
+    #   fire-and-forget if the connection ends without one.
+    #
+    # WHERE THIS IS WRONG, stated because the whole point of the exercise is
+    # that the obvious unit was wrong by 13x:
+    #
+    #   * HTTP/2 and HTTP/3 multiplex. Several logical requests can be in
+    #     flight on one connection at once, and a read for request A ends
+    #     request B's burst too. This UNDERCOUNTS fire-and-forget on
+    #     multiplexed connections -- the same direction as the
+    #     per-connection unit, though far less severely.
+    #   * Pipelining has the same shape.
+    #   * A server push or an unsolicited frame reads as a reply.
+    #
+    # It is not the true answer. It is a third estimate whose error is in a
+    # known direction, which is more than either of the other two offers.
+    # ---------------------------------------------------------------
+    req_ff = req_rr = 0
+    for key, evs in conn_events.items():
+        burst = False
+        for kind, _ts in evs:
+            if kind == "out":
+                burst = True
+            elif burst:            # a read closed an outbound burst
+                req_rr += 1
+                burst = False
+        if burst:                  # connection ended with writes unanswered
+            req_ff += 1
+    req_total = req_ff + req_rr
+    pct_req_ff = 100.0 * req_ff / req_total if req_total else 0.0
+
+    print()
+    print("=" * 62)
+    print("  THIRD UNIT -- per logical request")
+    print("=" * 62)
+    print("  logical requests                  %6d" % req_total)
+    print("  never answered                    %6d   %5.1f%%" % (req_ff, pct_req_ff))
+    print("  answered                          %6d   %5.1f%%"
+          % (req_rr, 100.0 - pct_req_ff if req_total else 0.0))
+    print()
+    print("  A logical request is a maximal run of writes on one connection")
+    print("  uninterrupted by a read. Undercounts on multiplexed (HTTP/2)")
+    print("  connections, where a reply to one request ends another's burst.")
+
     print()
     print("=" * 62)
     print("  SECOND UNIT -- per connection, not per syscall")
@@ -311,6 +428,15 @@ def main(argv=None) -> int:
     print("  never read a byte back            %6d   %5.1f%%" % (conn_ff, pct_conn_ff))
     print("  outbound ops on those connections %6d   %5.1f%%" % (ops_on_ff, pct_ops_ff))
     print()
+    print()
+    print("=" * 62)
+    print("  ALL THREE UNITS, SAME TRACE")
+    print("=" * 62)
+    print("    per syscall          %5.1f%%   counts TLS fragments as effects" % pct_ff)
+    print("    per logical request  %5.1f%%   <- the unit that means 'one effect'" % pct_req_ff)
+    print("    per connection       %5.1f%%   collapses mixed connections" % pct_conn_ff)
+    print()
+
     if n_conn:
         spread = pct_ff / pct_conn_ff if pct_conn_ff > 0.01 else float("inf")
         print("  per-syscall says %.1f%%, per-connection says %.1f%%" % (pct_ff, pct_conn_ff))
@@ -387,6 +513,9 @@ def main(argv=None) -> int:
             "strace": str(a.strace),
             "lines_total": n_lines,
             "lines_parsed": n_parsed,
+            "lines_stitched": n_stitched,
+            "lines_signal": n_signal,
+            "lines_unaccounted": n_other,
             "syscall": {
                 "total": total, "ff": ff, "rr": rr, "undetermined": un,
                 "pct": pct_ff,
@@ -394,6 +523,11 @@ def main(argv=None) -> int:
             "connection": {
                 "total": n_conn, "ff": conn_ff, "pct": pct_conn_ff,
                 "ops_on_ff": ops_on_ff, "ops_pct": pct_ops_ff,
+            },
+            "request": {
+                "total": req_total, "ff": req_ff, "rr": req_rr,
+                "pct": pct_req_ff,
+                "caveat": "undercounts on multiplexed connections",
             },
             "verdict": ("PASS" if pct_ff > 20 else
                         "MARGINAL" if pct_ff >= 10 else "FAIL"),

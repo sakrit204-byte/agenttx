@@ -1,0 +1,32 @@
+{
+  "v": 1,
+  "strace": "/tmp/claude-1000/-home-sakrit-Desktop-os-project-ideas/5cc2fa73-8848-478e-8db8-2353f498b2f7/scratchpad/gate2/readonly.strace",
+  "lines_total": 18677,
+  "lines_parsed": 13127,
+  "lines_stitched": 5497,
+  "lines_signal": 53,
+  "lines_unaccounted": 0,
+  "syscall": {
+    "total": 69,
+    "ff": 41,
+    "rr": 27,
+    "undetermined": 1,
+    "pct": 59.42028985507246
+  },
+  "connection": {
+    "total": 26,
+    "ff": 0,
+    "pct": 0.0,
+    "ops_on_ff": 0,
+    "ops_pct": 0.0
+  },
+  "request": {
+    "total": 55,
+    "ff": 1,
+    "rr": 54,
+    "pct": 1.8181818181818181,
+    "caveat": "undercounts on multiplexed connections"
+  },
+  "verdict": "PASS",
+  "trustworthy": false
+}

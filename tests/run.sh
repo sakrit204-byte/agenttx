@@ -93,6 +93,7 @@ run_test 0 tools/vm/headers-check.sh
 run_test 0 tests/p4/t01_gate.sh
 run_test 0 tests/p4/t06_weights.sh
 run_test 0 tests/p4/t06_sabotage.sh
+run_test 0 tests/p4/t04_labels.sh
 run_test 0 tests/p4/t07_infer.sh
 run_test 0 tests/p4/t08_deadlock.sh
 
