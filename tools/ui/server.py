@@ -575,6 +575,50 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):                                   # noqa: N802
+        """
+        Two actions, and both change the world, which is why they are POST:
+        starting a sandboxed session and deciding one.
+        """
+        path = self.path.split("?", 1)[0]
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            self._send(400, b'{"error":"bad json"}', "application/json")
+            return
+
+        if path == "/api/session/start":
+            lower = (body.get("dir") or "").strip()
+            cmd = (body.get("cmd") or "").strip()
+            if not lower or not cmd:
+                self._send(400, b'{"error":"dir and cmd are required"}',
+                           "application/json")
+                return
+            if not lower.startswith("/"):
+                self._send(400, b'{"error":"dir must be an absolute path in the guest"}',
+                           "application/json")
+                return
+            rc, so, se = GUEST.session_start(lower, cmd)
+            self._send(200, json.dumps({
+                "ok": rc == 0, "rc": rc, "stdout": so, "stderr": se,
+            }).encode(), "application/json")
+            return
+
+        if path == "/api/session/decide":
+            tx = str(body.get("tx") or "")
+            dec = body.get("decision")
+            if not tx or dec not in ("commit", "abort"):
+                self._send(400, b'{"error":"tx and decision (commit|abort) required"}',
+                           "application/json")
+                return
+            ok = GUEST.session_decide(tx, dec)
+            self._send(200, json.dumps({"ok": ok, "tx": tx, "decision": dec}).encode(),
+                       "application/json")
+            return
+
+        self._send(404, b'{"error":"no such action"}', "application/json")
+
     def do_GET(self):                                    # noqa: N802
         path = self.path.split("?", 1)[0]
         srv = self.server                                # type: ignore[attr-defined]
@@ -630,6 +674,26 @@ class Handler(BaseHTTPRequestHandler):
                                  "stream": r.get("stream")})
                     counts[r.get("status")] = counts.get(r.get("status"), 0) + 1
             self._send(200, json.dumps({"rows": rows, "counts": counts}).encode(),
+                       "application/json")
+            return
+
+        if path == "/api/sessions":
+            self._send(200, json.dumps({
+                "reachable": GUEST.alive(),
+                "error": None if GUEST.alive() else GUEST.last_error,
+                "sessions": GUEST.sessions(),
+            }).encode(), "application/json")
+            return
+
+        if path.startswith("/api/session/output"):
+            tx = ""
+            if "?" in self.path:
+                for kv in self.path.split("?", 1)[1].split("&"):
+                    k, _, v = kv.partition("=")
+                    if k == "tx":
+                        tx = v
+            self._send(200, json.dumps({"tx": tx,
+                                        "output": GUEST.session_output(tx)}).encode(),
                        "application/json")
             return
 

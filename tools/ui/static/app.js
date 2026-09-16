@@ -1024,3 +1024,173 @@ function renderDefer() {
 
 renderLabels();
 setInterval(() => { renderLabels(); renderDefer(); }, 6000);
+
+/* ============================================================
+ * THE SANDBOX CONSOLE
+ *
+ * The part of this page that is a tool rather than an explanation. Start a
+ * command under a transaction, watch what it touched, then decide whether it
+ * becomes real.
+ *
+ * The decision is the product. Everything the command wrote is sitting in a
+ * copy-on-write layer that has never touched the real directory, and it stays
+ * there until somebody clicks. `txctl session` holds the transaction open
+ * precisely so this moment exists.
+ * ==========================================================*/
+const ST = {
+  running: ['st-running', 'running'],
+  'awaiting-decision': ['st-await', 'awaiting your decision'],
+  committed: ['st-committed', 'committed'],
+  aborted: ['st-aborted', 'aborted — nothing happened'],
+  failed: ['st-failed', 'failed'],
+  starting: ['st-running', 'starting'],
+};
+
+let SB_OPEN = {};      // tx -> whether its output pane is expanded
+let SB_BUSY = false;
+
+function diffMark(kind) {
+  if (kind === 'deleted') return ['m-del', '−', 'deleted (whiteout)'];
+  if (kind === 'dir')     return ['m-dir', '/', 'directory'];
+  return ['m-add', '+', 'written'];
+}
+
+function renderSessions(d) {
+  const box = $('sbSessions');
+  if (!d.reachable) {
+    box.innerHTML = `<div class="missing">no link to the guest — ${esc(d.error || '')}<br>
+      <span style="color:var(--dimmer)">the sandbox lives in the QEMU guest;
+      boot it with <code>SERIAL_LOG=/tmp/c.log make vm-boot</code></span></div>`;
+    return;
+  }
+  const sess = (d.sessions || []).slice().sort((a, b) => Number(b.tx) - Number(a.tx));
+  if (!sess.length) {
+    box.innerHTML = `<div class="missing">no sessions yet — run something above</div>`;
+    return;
+  }
+
+  let h = '';
+  sess.forEach(s => {
+    const [cls, label] = ST[s.status] || ['st-running', esc(s.status || '?')];
+    const awaiting = s.status === 'awaiting-decision';
+    const done = ['committed', 'aborted', 'failed'].includes(s.status);
+    const nfiles = Number(s.changed || 0);
+
+    h += `<div class="sess ${awaiting ? 'decide' : ''} ${done ? 'done' : ''}">
+      <div class="head">
+        <span class="id">tx ${esc(s.tx)}</span>
+        <span class="st ${cls}">${label}</span>
+        <span class="cmd">${esc(s.cmd || '')}</span>
+        <span class="pmark">${esc(s.lower || '')}</span>
+        ${s.exit !== undefined && s.exit !== '' ?
+          `<span class="pmark ${s.exit === '0' ? 'yes' : 'no'}">exit ${esc(s.exit)}</span>` : ''}
+      </div>
+      <div class="body2">
+        <div>
+          <div class="note">what it changed
+            <span style="color:var(--dimmer)">— from the CoW upper layer, ${nfiles} entr${nfiles === 1 ? 'y' : 'ies'}</span></div>
+          <ul class="difflist">`;
+    if (!s.files || !s.files.length) {
+      h += `<li style="color:var(--dimmer)">nothing written</li>`;
+    } else {
+      s.files.forEach(f => {
+        const [m, ch, title] = diffMark(f.kind);
+        h += `<li><span class="m ${m}" title="${title}">${ch}</span>${esc(f.path)}</li>`;
+      });
+      if (nfiles > s.files.length) {
+        h += `<li style="color:var(--comp)">… ${nfiles - s.files.length} more (listing capped at 100)</li>`;
+      }
+    }
+    h += `</ul></div>
+        <div>
+          <div class="note">output
+            <button class="btn" style="float:right;font-size:9.5px;padding:1px 7px"
+              onclick="loadOutput('${esc(s.tx)}')">refresh</button></div>
+          <div class="outbox" id="out${esc(s.tx)}">${esc(SB_OPEN[s.tx] || '(click refresh)')}</div>
+        </div>
+      </div>`;
+
+    if (awaiting) {
+      h += `<div class="decidebar">
+        <b style="color:var(--comp)">Nothing above is real yet.</b>
+        <span class="note" style="flex:1 1 200px">Commit merges the
+          copy-on-write layer into <code>${esc(s.lower || '')}</code> and replays any
+          deferred network sends. Abort discards both — the writes never happened.</span>
+        <button class="btn commit" onclick="decide('${esc(s.tx)}','commit')">Commit</button>
+        <button class="btn abort"  onclick="decide('${esc(s.tx)}','abort')">Abort</button>
+      </div>`;
+    } else if (s.status === 'aborted') {
+      h += `<div class="decidebar"><span class="note" style="color:var(--rev)">
+        Discarded. <code>${esc(s.lower || '')}</code> is byte-identical to before the
+        run, and any deferred sends were dropped without being emitted.</span></div>`;
+    } else if (s.status === 'committed') {
+      h += `<div class="decidebar"><span class="note" style="color:var(--def)">
+        Merged into <code>${esc(s.lower || '')}</code>. Deferred sends were replayed in
+        <code>seq</code> order at this point, and not before.</span></div>`;
+    }
+    h += `</div>`;
+  });
+  box.innerHTML = h;
+}
+
+async function loadOutput(tx) {
+  try {
+    const d = await (await fetch('/api/session/output?tx=' + encodeURIComponent(tx))).json();
+    SB_OPEN[tx] = d.output || '(no output)';
+    const el2 = $('out' + tx);
+    if (el2) el2.textContent = SB_OPEN[tx];
+  } catch (e) { /* transient */ }
+}
+
+async function decide(tx, what) {
+  if (SB_BUSY) return;
+  SB_BUSY = true;
+  $('sbHint').textContent = `sending ${what} for tx ${tx}…`;
+  try {
+    await fetch('/api/session/decide', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({tx, decision: what}),
+    });
+    setTimeout(refreshSessions, 900);
+    setTimeout(refreshSessions, 2500);
+  } finally {
+    SB_BUSY = false;
+    $('sbHint').textContent = 'Everything the command writes goes into a ' +
+      'copy-on-write layer. Nothing is real until you commit.';
+  }
+}
+
+async function refreshSessions() {
+  try {
+    const d = await (await fetch('/api/sessions')).json();
+    renderSessions(d);
+  } catch (e) { /* transient */ }
+}
+
+$('sbRun').onclick = async () => {
+  if (SB_BUSY) return;
+  const dir = $('sbDir').value.trim(), cmd = $('sbCmd').value.trim();
+  if (!dir || !cmd) { $('sbHint').textContent = 'need a directory and a command'; return; }
+  SB_BUSY = true;
+  $('sbRun').disabled = true;
+  $('sbHint').textContent = 'starting a transaction in the guest…';
+  try {
+    const r = await (await fetch('/api/session/start', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({dir, cmd}),
+    })).json();
+    $('sbHint').textContent = r.ok
+      ? 'started — the command runs inside the overlay; nothing is real until you decide'
+      : ('could not start: ' + esc((r.stdout || '') + (r.stderr || '') + (r.error || '')));
+  } catch (e) {
+    $('sbHint').textContent = 'start failed: ' + e;
+  } finally {
+    SB_BUSY = false;
+    $('sbRun').disabled = false;
+    setTimeout(refreshSessions, 1200);
+    setTimeout(refreshSessions, 3000);
+  }
+};
+
+refreshSessions();
+setInterval(refreshSessions, 3000);

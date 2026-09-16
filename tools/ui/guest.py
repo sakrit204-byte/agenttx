@@ -211,6 +211,85 @@ echo "---END---"
             pass
         return out
 
+    # --- sandbox sessions (the operator console) -----------------------
+    def session_start(self, lower: str, cmd: str) -> tuple[int, str, str]:
+        """
+        Launch a held transaction around `cmd`, with `lower` protected.
+
+        setsid + & so the session outlives this ssh connection: it is
+        supposed to sit at `awaiting-decision` until a human decides, which
+        may be minutes. Tying it to the request that started it would abort
+        every session the moment the page was refreshed.
+        """
+        script = f"""
+mkdir -p {shlex.quote(lower)} /run/agenttx
+cd {shlex.quote(self.repo)}
+setsid ./tools/harness/txctl session --lower {shlex.quote(lower)} \
+    -- {cmd} >/run/agenttx/last-start.log 2>&1 &
+sleep 2
+cat /run/agenttx/last-start.log
+"""
+        return self._run_stdin(script)
+
+    SESSIONS_SH = r"""
+set -u
+for d in /run/agenttx/session-*; do
+  [ -d "$d" ] || continue
+  tx=${d##*/session-}
+  echo "---SESSION $tx---"
+  for k in status exit lower cmd; do
+    printf '%s=' "$k"; head -c 400 "$d/$k" 2>/dev/null | tr -d '
+'; echo
+  done
+  U=/var/lib/agenttx/tx-$tx/upper
+  n=$(find "$U" -mindepth 1 2>/dev/null | wc -l)
+  echo "changed=$n"
+  find "$U" -mindepth 1 2>/dev/null | head -100 | while read -r f; do
+    rel=${f#"$U/"}
+    if [ -c "$f" ]; then echo "F deleted $rel"
+    elif [ -d "$f" ]; then echo "F dir $rel"
+    else echo "F file $rel"; fi
+  done
+done
+echo "---END---"
+"""
+
+    def sessions(self) -> list[dict]:
+        if not self.alive():
+            return []
+        rc, so, _e = self._run_stdin(self.SESSIONS_SH)
+        out, cur = [], None
+        for line in so.splitlines():
+            if line.startswith("---SESSION "):
+                cur = {"tx": line.split()[1].rstrip("-"), "files": []}
+                out.append(cur)
+                continue
+            if line.startswith("---END"):
+                break
+            if cur is None:
+                continue
+            if line.startswith("F "):
+                p = line.split(None, 2)
+                if len(p) == 3:
+                    cur["files"].append({"kind": p[1], "path": p[2]})
+            elif "=" in line:
+                k, _, v = line.partition("=")
+                cur[k] = v
+        return out
+
+    def session_output(self, tx: str, tail: int = 400) -> str:
+        rc, so, _e = self.run(
+            f"tail -n {int(tail)} /run/agenttx/session-{shlex.quote(str(tx))}/output 2>/dev/null")
+        return so
+
+    def session_decide(self, tx: str, decision: str) -> bool:
+        if decision not in ("commit", "abort"):
+            return False
+        rc, _o, _e = self.run(
+            f"printf '%s' {shlex.quote(decision)} > "
+            f"/run/agenttx/session-{shlex.quote(str(tx))}/decide")
+        return rc == 0
+
     def _run_stdin(self, script: str) -> tuple[int, str, str]:
         try:
             p = subprocess.run(self._cmd("bash -s"), input=script,

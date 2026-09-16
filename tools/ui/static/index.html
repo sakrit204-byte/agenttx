@@ -12,6 +12,27 @@
   <div class="pills" id="pills"></div>
 </header>
 
+<!-- ================= SANDBOX (the actual tool) ================= -->
+<div class="grid" style="margin-top:14px">
+  <div class="card" id="sandboxcard">
+    <h2>sandbox <span class="src">run something under a transaction, then decide</span></h2>
+    <div class="body">
+      <div class="runbar">
+        <label>protected directory
+          <input id="sbDir" value="/tmp/work" spellcheck="false">
+        </label>
+        <label style="flex:2 1 340px">command to run inside it
+          <input id="sbCmd" value="sh -c 'echo hello > note.txt; ls -la'" spellcheck="false">
+        </label>
+        <button class="btn primary" id="sbRun">Run sandboxed</button>
+      </div>
+      <p class="note" id="sbHint">Everything the command writes goes into a
+        copy-on-write layer. Nothing is real until you commit.</p>
+      <div id="sbSessions"></div>
+    </div>
+  </div>
+</div>
+
 <!-- ================= THE MECHANISM ================= -->
 <div class="grid" style="margin-top:14px">
   <div class="card">

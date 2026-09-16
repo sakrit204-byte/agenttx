@@ -32,6 +32,7 @@
 #include <sys/mount.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -503,6 +504,219 @@ static int cmd_run(int fd, __u32 flags, __u32 timeout_ms,
 	return verified ? 0 : 1;
 }
 
+/*
+ * `txctl session` --- the operator mode.
+ *
+ * `txctl run` decides for you: exit 0 commits, anything else aborts. That is
+ * verification-delimited and it is the right default for CI. It is the wrong
+ * shape for a human at a console, who wants to SEE what the agent did and
+ * then decide.
+ *
+ * So `session` does everything `run` does and then STOPS, holding the
+ * transaction open, until somebody writes a decision. The sandbox is only
+ * useful if the moment before commit is inspectable, and that moment does not
+ * exist unless something waits.
+ *
+ * State lives in /run/agenttx/session-<tx>/ so the UI can read it without
+ * talking to this process:
+ *
+ *   tx        the transaction id
+ *   lower     the directory under protection
+ *   cmd       what was run
+ *   status    starting | running | awaiting-decision | committed | aborted | failed
+ *   exit      the command's exit code, once it has one
+ *   output    the command's stdout+stderr, streamed
+ *   decide    written by the operator: "commit" or "abort"
+ */
+#define TX_SESSION_DIR	"/run/agenttx"
+
+static int sess_write(const char *dir, const char *name, const char *fmt, ...)
+{
+	char path[512];
+	FILE *f;
+	va_list ap;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	f = fopen(path, "w");
+	if (!f)
+		return -1;
+	va_start(ap, fmt);
+	vfprintf(f, fmt, ap);
+	va_end(ap);
+	fclose(f);
+	return 0;
+}
+
+static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
+		       const char *lower, char **argv)
+{
+	int to_holder[2], to_parent[2];
+	char dir[256], path[512], buf[64];
+	tx_id_t tx = TX_ID_NONE;
+	pid_t holder;
+	int status = 0, i, decided = 0, commit = 0;
+
+	if (!lower) {
+		fprintf(stderr, "txctl session: --lower DIR is required\n");
+		return 2;
+	}
+	if (pipe(to_holder) < 0 || pipe(to_parent) < 0) {
+		perror("pipe");
+		return 1;
+	}
+	if (cmd_supervisor(fd) != 0)
+		return 1;
+
+	holder = fork();
+	if (holder < 0) {
+		perror("fork");
+		return 1;
+	}
+
+	if (holder == 0) {			/* the holder: owns the tx */
+		pid_t kid;
+		int st = 0;
+		char go;
+
+		close(to_holder[1]);
+		close(to_parent[0]);
+		if (do_begin(fd, flags, timeout_ms, &tx) < 0)
+			_exit(70);
+		if (write(to_parent[1], &tx, sizeof(tx)) != (ssize_t)sizeof(tx))
+			_exit(71);
+		if (tx_setup_overlay(tx, lower) < 0)
+			_exit(76);
+
+		snprintf(dir, sizeof(dir), "%s/session-%llu",
+			 TX_SESSION_DIR, (unsigned long long)tx);
+		mkdir(dir, 0700);
+
+		kid = fork();
+		if (kid < 0)
+			_exit(72);
+		if (kid == 0) {
+			char e[32];
+			int ofd;
+
+			snprintf(e, sizeof(e), "%llu", (unsigned long long)tx);
+			setenv("AGENTTX_TX_ID", e, 1);
+			snprintf(path, sizeof(path), "%s/output", dir);
+			ofd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+			if (ofd >= 0) {
+				dup2(ofd, 1);
+				dup2(ofd, 2);
+				close(ofd);
+			}
+			/* Run WITH THE PROTECTED DIRECTORY AS CWD, so a relative
+			 * path from the agent lands inside the overlay rather
+			 * than beside it. */
+			if (chdir(lower) != 0)
+				_exit(78);
+			execvp(argv[0], argv);
+			_exit(127);
+		}
+		if (waitpid(kid, &st, 0) < 0)
+			_exit(73);
+		if (write(to_parent[1], &st, sizeof(st)) != (ssize_t)sizeof(st))
+			_exit(74);
+		if (read(to_holder[0], &go, 1) != 1)
+			_exit(75);
+		_exit(0);
+	}
+
+	/* ---- the supervisor ---- */
+	close(to_holder[0]);
+	close(to_parent[1]);
+
+	if (read(to_parent[0], &tx, sizeof(tx)) != (ssize_t)sizeof(tx)) {
+		fprintf(stderr, "txctl: holder reported no transaction id\n");
+		return 1;
+	}
+	snprintf(dir, sizeof(dir), "%s/session-%llu", TX_SESSION_DIR,
+		 (unsigned long long)tx);
+	mkdir(TX_SESSION_DIR, 0700);
+	mkdir(dir, 0700);
+	sess_write(dir, "tx", "%llu\n", (unsigned long long)tx);
+	sess_write(dir, "lower", "%s\n", lower);
+	{
+		FILE *f;
+		snprintf(path, sizeof(path), "%s/cmd", dir);
+		f = fopen(path, "w");
+		if (f) {
+			for (i = 0; argv[i]; i++)
+				fprintf(f, "%s%s", i ? " " : "", argv[i]);
+			fprintf(f, "\n");
+			fclose(f);
+		}
+	}
+	sess_write(dir, "status", "running\n");
+	printf("tx=%llu session started -> %s\n", (unsigned long long)tx, dir);
+	fflush(stdout);
+
+	if (read(to_parent[0], &status, sizeof(status)) != (ssize_t)sizeof(status)) {
+		sess_write(dir, "status", "failed\n");
+		do_end(fd, 0, tx, TX_REASON_UNSPEC, 1);
+		tx_effects_finish(tx, 0);
+		return 1;
+	}
+	sess_write(dir, "exit", "%d\n",
+		   WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status));
+	sess_write(dir, "status", "awaiting-decision\n");
+	printf("tx=%llu awaiting decision (exit %d)\n", (unsigned long long)tx,
+	       WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+	fflush(stdout);
+
+	/*
+	 * Hold the transaction open. The agent has finished; nothing it did is
+	 * real yet. This is the whole point of the sandbox and it is where a
+	 * human looks at the diff.
+	 */
+	snprintf(path, sizeof(path), "%s/decide", dir);
+	for (i = 0; i < 60 * 60 * 20; i++) {	/* up to ~1h at 50ms */
+		FILE *f = fopen(path, "r");
+
+		if (f) {
+			if (fgets(buf, sizeof(buf), f)) {
+				if (!strncmp(buf, "commit", 6)) { decided = 1; commit = 1; }
+				else if (!strncmp(buf, "abort", 5)) { decided = 1; commit = 0; }
+			}
+			fclose(f);
+			if (decided)
+				break;
+		}
+		usleep(50000);
+	}
+
+	if (!decided) {
+		printf("tx=%llu no decision within the window -> abort (fail closed)\n",
+		       (unsigned long long)tx);
+		commit = 0;
+	}
+
+	if (commit) {
+		if (do_end(fd, 1, tx, TX_REASON_HUMAN, 0) == 0) {
+			tx_effects_finish(tx, 1);
+			sess_write(dir, "status", "committed\n");
+		} else {
+			tx_effects_finish(tx, 0);
+			sess_write(dir, "status", "failed\n");
+		}
+	} else {
+		do_end(fd, 0, tx, decided ? TX_REASON_HUMAN : TX_REASON_DEADLINE, 0);
+		tx_effects_finish(tx, 0);
+		sess_write(dir, "status", "aborted\n");
+	}
+
+	{
+		char done = 1;
+		if (write(to_holder[1], &done, 1) != 1)
+			perror("txctl: releasing the holder");
+	}
+	close(to_holder[1]);
+	waitpid(holder, NULL, 0);
+	return commit ? 0 : 1;
+}
+
 static void usage(void)
 {
 	fputs(
@@ -513,6 +727,7 @@ static void usage(void)
 "  stat   [--tx ID] [--json]           report state\n"
 "  commit [--tx ID] [--reason N]       supervisor only\n"
 "  abort  [--tx ID] [--reason N]\n"
+"  session --lower DIR -- CMD [ARGS]   run, then HOLD for a human decision\n"
 "  run    [--flags N] [--lower DIR] -- CMD [ARGS]\n"
 "                                      verification-delimited transaction;\n"
 "                                      --lower puts CMD inside a CoW overlay\n",
@@ -573,6 +788,13 @@ int main(int argc, char **argv)
 		rc = do_end(fd, 1, tx, reason, 0) < 0 ? 1 : 0;
 	} else if (!strcmp(cmd, "abort")) {
 		rc = do_end(fd, 0, tx, reason, 0) < 0 ? 1 : 0;
+	} else if (!strcmp(cmd, "session")) {
+		if (i >= argc || strcmp(argv[i], "--")) {
+			fprintf(stderr, "txctl session: need -- CMD\n");
+			rc = 2;
+		} else {
+			rc = cmd_session(fd, flags, timeout_ms, lower, &argv[i + 1]);
+		}
 	} else if (!strcmp(cmd, "run")) {
 		if (i >= argc || strcmp(argv[i], "--")) {
 			fprintf(stderr, "txctl run: need -- CMD\n");
