@@ -128,7 +128,7 @@ dmesg 2>/dev/null | grep 'agenttx' | tail -40 || true
 echo "---BPF---"
 grep -q bpf /sys/kernel/security/lsm 2>/dev/null && echo "lsm yes" || echo "lsm no"
 [ -r /sys/kernel/btf/agenttx ] && echo "modbtf yes" || echo "modbtf no"
-[ -x "$R/src/bpf/txload" ] && echo "loader yes" || echo "loader no"
+[ -x /usr/local/bin/txload ] && echo "loader yes" || echo "loader no"
 pgrep -x txload >/dev/null 2>&1 && echo "running yes" || echo "running no"
 echo "---HEALTH---"
 dmesg 2>/dev/null | grep -cE 'BUG:|KASAN|WARNING:|circular locking' || echo 0
@@ -211,8 +211,52 @@ echo "---END---"
             pass
         return out
 
+    # --- deploy: binaries must run from LOCAL disk, not the 9p share ----
+    #
+    # The repo is shared into the guest over 9p so edits reach it instantly.
+    # That works for source. It does NOT reliably work for EXECUTING a
+    # binary: demand-paging an executable over 9p with cache=none can fault
+    # mid-load, and the failure is a SIGSEGV inside ld-linux before main()
+    # runs. The binary is not corrupt -- same md5 on both sides -- and
+    # copying it to local disk makes it run.
+    #
+    # It also fails intermittently, which is worse: the same binary ran from
+    # the share for days and then stopped after growing by a few KB. So
+    # deploy is not an optimisation, it is the only correct way to run them.
+    DEPLOY_SH = r"""
+set -u
+R=%s
+mkdir -p /usr/local/lib/agenttx
+changed=0
+for f in tools/harness/txctl src/bpf/txload; do
+  src="$R/$f"; dst="/usr/local/bin/$(basename $f)"
+  [ -f "$src" ] || continue
+  if ! cmp -s "$src" "$dst" 2>/dev/null; then
+    cp -f "$src" "$dst" && chmod 0755 "$dst" && changed=$((changed+1))
+  fi
+done
+if [ -f "$R/agenttx.ko" ]; then
+  if ! cmp -s "$R/agenttx.ko" /usr/local/lib/agenttx/agenttx.ko 2>/dev/null; then
+    cp -f "$R/agenttx.ko" /usr/local/lib/agenttx/agenttx.ko && changed=$((changed+1))
+  fi
+fi
+echo "deployed=$changed"
+"""
+
+    def deploy(self) -> int:
+        """Copy the binaries out of the 9p share. Returns how many changed."""
+        rc, so, _e = self._run_stdin(self.DEPLOY_SH % shlex.quote(self.repo))
+        for line in so.splitlines():
+            if line.startswith("deployed="):
+                try:
+                    return int(line.split("=", 1)[1])
+                except ValueError:
+                    pass
+        return 0
+
     # --- sandbox sessions (the operator console) -----------------------
-    def session_start(self, lower: str, cmd: str) -> tuple[int, str, str]:
+    def session_start(self, lower: str, cmd: str,
+                      as_user: str = "agent") -> tuple[int, str, str]:
         """
         Launch a held transaction around `cmd`, with `lower` protected.
 
@@ -221,11 +265,16 @@ echo "---END---"
         may be minutes. Tying it to the request that started it would abort
         every session the moment the page was refreshed.
         """
+        # Deploy first. The binaries live on a 9p share and must NOT be
+        # executed from it: demand-paging an executable over 9p faults inside
+        # ld-linux before main() runs, and the SIGSEGV names nothing useful.
+        # Byte-identical md5 on both sides; it is the execution, not the file.
+        self.deploy()
         script = f"""
 mkdir -p {shlex.quote(lower)} /run/agenttx
-cd {shlex.quote(self.repo)}
-setsid ./tools/harness/txctl session --lower {shlex.quote(lower)} \
-    -- {cmd} >/run/agenttx/last-start.log 2>&1 &
+chown {shlex.quote(as_user)} {shlex.quote(lower)} 2>/dev/null || true
+cd {shlex.quote(lower)}
+setsid /usr/local/bin/txctl session --lower {shlex.quote(lower)} --as {shlex.quote(as_user)} -- {cmd} >/run/agenttx/last-start.log 2>&1 &
 sleep 2
 cat /run/agenttx/last-start.log
 """
@@ -275,6 +324,75 @@ echo "---END---"
             elif "=" in line:
                 k, _, v = line.partition("=")
                 cur[k] = v
+        return out
+
+    # --- the change report, in terms a person can act on ---------------
+    #
+    # "3 entries in the upper layer" is a true statement nobody can decide
+    # from. What a person deciding commit-or-abort needs is: which files,
+    # what KIND of change, how big, and what it looks like. The CoW layout
+    # gives all of that for free -- upper/ is the new version and the lower
+    # symlink points at the old one, so a diff is just two paths.
+    DIFF_SH = r"""
+set -u
+TX=%s
+U=/var/lib/agenttx/tx-$TX/upper
+L=$(readlink /var/lib/agenttx/tx-$TX/lower 2>/dev/null)
+[ -d "$U" ] || { echo "---END---"; exit 0; }
+find "$U" -mindepth 1 2>/dev/null | sort | while read -r f; do
+  rel=${f#"$U/"}
+  old="$L/$rel"
+  if [ -c "$f" ]; then
+    # a character device in the upper layer is overlayfs's whiteout: the
+    # agent DELETED this file, and the old contents are still in lower.
+    n=$(wc -l < "$old" 2>/dev/null || echo 0)
+    echo "ENTRY deleted $rel"
+    echo "STAT 0 $n $(stat -c %%s "$old" 2>/dev/null || echo 0)"
+    echo "PREVIEW-END"
+  elif [ -d "$f" ]; then
+    echo "ENTRY dir $rel"
+    echo "STAT 0 0 0"
+    echo "PREVIEW-END"
+  elif [ -e "$old" ]; then
+    add=$(diff --unchanged-line-format= --old-line-format= --new-line-format=x "$old" "$f" 2>/dev/null | wc -c)
+    del=$(diff --unchanged-line-format= --old-line-format=x --new-line-format= "$old" "$f" 2>/dev/null | wc -c)
+    echo "ENTRY modified $rel"
+    echo "STAT $add $del $(stat -c %%s "$f" 2>/dev/null || echo 0)"
+    diff -u "$old" "$f" 2>/dev/null | head -40 | sed 's/^/D /'
+    echo "PREVIEW-END"
+  else
+    n=$(wc -l < "$f" 2>/dev/null || echo 0)
+    echo "ENTRY created $rel"
+    echo "STAT $n 0 $(stat -c %%s "$f" 2>/dev/null || echo 0)"
+    head -24 "$f" 2>/dev/null | sed 's/^/D /'
+    echo "PREVIEW-END"
+  fi
+done
+echo "---END---"
+"""
+
+    def session_diff(self, tx: str) -> list[dict]:
+        if not self.alive():
+            return []
+        rc, so, _e = self._run_stdin(self.DIFF_SH % str(int(tx)))
+        out, cur = [], None
+        for line in so.splitlines():
+            if line.startswith("ENTRY "):
+                p = line.split(None, 2)
+                cur = {"kind": p[1], "path": p[2] if len(p) > 2 else "",
+                       "added": 0, "removed": 0, "bytes": 0, "preview": []}
+                out.append(cur)
+            elif line.startswith("STAT ") and cur is not None:
+                p = line.split()
+                try:
+                    cur["added"], cur["removed"], cur["bytes"] = (
+                        int(p[1]), int(p[2]), int(p[3]))
+                except (IndexError, ValueError):
+                    pass
+            elif line.startswith("D ") and cur is not None:
+                cur["preview"].append(line[2:])
+            elif line == "PREVIEW-END":
+                cur = None
         return out
 
     def session_output(self, tx: str, tail: int = 400) -> str:

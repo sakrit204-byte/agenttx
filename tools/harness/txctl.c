@@ -33,6 +33,8 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <pwd.h>
+#include <grp.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,7 +71,7 @@ static const char *tx_root(void)
  * Called in the HOLDER, after tx_begin and before exec, so the namespace
  * and the transaction have the same lifetime.
  */
-static int tx_setup_overlay(tx_id_t tx, const char *lower)
+static int tx_setup_overlay(tx_id_t tx, const char *lower, const char *as_user)
 {
 	char base[256], upper[320], work[320], merged[320], link[320];
 	char opts[2048];
@@ -116,6 +118,32 @@ static int tx_setup_overlay(tx_id_t tx, const char *lower)
 		fprintf(stderr, "txctl: symlink %s -> %s: %s\n",
 			link, real, strerror(errno));
 		return -1;
+	}
+
+	/*
+	 * Hand the copy-on-write area to the user the agent will become.
+	 *
+	 * src/fs/mount.c creates these as root, mode 0700, because the kernel
+	 * has no idea who is going to write into them. overlayfs performs
+	 * copy-up with the *caller's* credentials, so an unprivileged agent
+	 * writing through the merged view needs to own upper/ and work/ --
+	 * otherwise every write fails with EACCES and the sandbox looks
+	 * broken rather than protective.
+	 */
+	if (as_user) {
+		struct passwd *pw = getpwnam(as_user);
+
+		if (pw) {
+			if (chown(upper, pw->pw_uid, pw->pw_gid) != 0 ||
+			    chown(work, pw->pw_uid, pw->pw_gid) != 0 ||
+			    chown(merged, pw->pw_uid, pw->pw_gid) != 0)
+				fprintf(stderr,
+					"txctl: warning: cannot give the CoW area to %s: %s\n",
+					as_user, strerror(errno));
+			if (chmod(base, 0755) != 0)
+				fprintf(stderr, "txctl: warning: chmod %s: %s\n",
+					base, strerror(errno));
+		}
 	}
 
 	if (unshare(CLONE_NEWNS) < 0) {
@@ -428,7 +456,7 @@ static int cmd_run(int fd, __u32 flags, __u32 timeout_ms,
 		if (write(to_parent[1], &tx, sizeof(tx)) != (ssize_t)sizeof(tx))
 			_exit(71);
 
-		if (lower && tx_setup_overlay(tx, lower) < 0)
+		if (lower && tx_setup_overlay(tx, lower, NULL) < 0)
 			_exit(76);
 
 		kid = fork();
@@ -547,8 +575,49 @@ static int sess_write(const char *dir, const char *name, const char *fmt, ...)
 	return 0;
 }
 
+/*
+ * Drop to an unprivileged user before exec'ing the agent.
+ *
+ * The supervisor needs CAP_SYS_ADMIN -- to register as supervisor, to
+ * unshare a mount namespace, to mount the overlay. The AGENT needs none of
+ * that, and the threat model says it is the untrusted party: "adversary is a
+ * prompt injection with full control of agent output".
+ *
+ * Running it as root would also mean the only thing between an injected
+ * command and the host is the VM boundary, with the transaction reduced to
+ * bookkeeping. And Claude Code refuses --dangerously-skip-permissions as
+ * root, which is a sound check on its part and the thing that surfaced this.
+ *
+ * Order matters: setgroups, then setgid, then setuid. Doing setuid first
+ * drops the privilege needed to do the other two, and the failure is silent.
+ */
+static int drop_to(const char *user)
+{
+	struct passwd *pw = getpwnam(user);
+
+	if (!pw) {
+		fprintf(stderr, "txctl: no such user: %s\n", user);
+		return -1;
+	}
+	if (initgroups(pw->pw_name, pw->pw_gid) != 0 ||
+	    setgid(pw->pw_gid) != 0 ||
+	    setuid(pw->pw_uid) != 0) {
+		fprintf(stderr, "txctl: cannot drop to %s: %s\n",
+			user, strerror(errno));
+		return -1;
+	}
+	if (setuid(0) == 0) {		/* must NOT succeed */
+		fprintf(stderr, "txctl: privilege drop did not stick\n");
+		return -1;
+	}
+	setenv("HOME", pw->pw_dir, 1);
+	setenv("USER", pw->pw_name, 1);
+	setenv("LOGNAME", pw->pw_name, 1);
+	return 0;
+}
+
 static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
-		       const char *lower, char **argv)
+		       const char *lower, const char *as_user, char **argv)
 {
 	int to_holder[2], to_parent[2];
 	char dir[256], path[512], buf[64];
@@ -584,7 +653,7 @@ static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
 			_exit(70);
 		if (write(to_parent[1], &tx, sizeof(tx)) != (ssize_t)sizeof(tx))
 			_exit(71);
-		if (tx_setup_overlay(tx, lower) < 0)
+		if (tx_setup_overlay(tx, lower, as_user) < 0)
 			_exit(76);
 
 		snprintf(dir, sizeof(dir), "%s/session-%llu",
@@ -612,6 +681,8 @@ static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
 			 * than beside it. */
 			if (chdir(lower) != 0)
 				_exit(78);
+			if (as_user && drop_to(as_user) != 0)
+				_exit(79);
 			execvp(argv[0], argv);
 			_exit(127);
 		}
@@ -727,7 +798,10 @@ static void usage(void)
 "  stat   [--tx ID] [--json]           report state\n"
 "  commit [--tx ID] [--reason N]       supervisor only\n"
 "  abort  [--tx ID] [--reason N]\n"
-"  session --lower DIR -- CMD [ARGS]   run, then HOLD for a human decision\n"
+"  session --lower DIR [--as USER] -- CMD [ARGS]\n"
+"                                      run, then HOLD for a human decision;\n"
+"                                      --as drops the AGENT to an\n"
+"                                      unprivileged user (supervisor stays root)\n"
 "  run    [--flags N] [--lower DIR] -- CMD [ARGS]\n"
 "                                      verification-delimited transaction;\n"
 "                                      --lower puts CMD inside a CoW overlay\n",
@@ -738,6 +812,7 @@ int main(int argc, char **argv)
 {
 	__u32 flags = TX_F_DEFER_NET | TX_F_COW_FS | TX_F_ESCALATE;
 	const char *lower = NULL;
+	const char *as_user = NULL;
 	__u32 timeout_ms = 0, reason = TX_REASON_UNSPEC;
 	tx_id_t tx = TX_ID_NONE;
 	int as_json = 0, i, fd, rc;
@@ -760,6 +835,8 @@ int main(int argc, char **argv)
 			reason = (__u32)strtoul(argv[++i], NULL, 0);
 		else if (!strcmp(argv[i], "--lower") && i + 1 < argc)
 			lower = argv[++i];
+		else if (!strcmp(argv[i], "--as") && i + 1 < argc)
+			as_user = argv[++i];
 		else if (!strcmp(argv[i], "--json"))
 			as_json = 1;
 		else if (!strcmp(argv[i], "--"))
@@ -793,7 +870,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "txctl session: need -- CMD\n");
 			rc = 2;
 		} else {
-			rc = cmd_session(fd, flags, timeout_ms, lower, &argv[i + 1]);
+			rc = cmd_session(fd, flags, timeout_ms, lower, as_user, &argv[i + 1]);
 		}
 	} else if (!strcmp(cmd, "run")) {
 		if (i >= argc || strcmp(argv[i], "--")) {

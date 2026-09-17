@@ -24,7 +24,10 @@ BUILD="$REPO/tools/vm/build"
 KERNEL="$KBUILD_OUT/arch/x86/boot/bzImage"
 DISK="$BUILD/rootfs.qcow2"
 
-MEM="${MEM:-4G}"
+# 6G, not 4G: the guest now hosts a Node-based agent as well as the kernel
+# under test, and an OOM inside the sandbox looks exactly like a transaction
+# bug. The host has ~9G available; leaving it 3G plus cache is the trade.
+MEM="${MEM:-6G}"
 CPUS="${CPUS:-4}"
 SSH_PORT="${SSH_PORT:-2222}"
 GDB="${GDB:-0}"
