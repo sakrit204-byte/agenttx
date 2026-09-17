@@ -40,6 +40,7 @@
 #include <sys/stat.h>
 #include <netinet/in.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -393,7 +394,7 @@ int main(int argc, char **argv)
 	struct ring_buffer *rb = NULL;
 	struct bpf_link *tcx_links[8] = {};
 	int n_links = 0;
-	int once = 0, stats = 0, err, i;
+	int once = 0, stats = 0, err, i, do_pin = 0, do_unpin = 0;
 	const char *jpath = NULL, *mpath = NULL;
 	int defer_ports[16], n_defer = 0;
 
@@ -403,12 +404,16 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--jsonl") && i + 1 < argc) jpath = argv[++i];
 
 		else if (!strcmp(argv[i], "--model") && i + 1 < argc) mpath = argv[++i];
+		else if (!strcmp(argv[i], "--pin"))   do_pin = 1;
+		else if (!strcmp(argv[i], "--unpin")) do_unpin = 1;
 		else if (!strcmp(argv[i], "--defer-port") && i + 1 < argc &&
 			 n_defer < 16) defer_ports[n_defer++] = atoi(argv[++i]);
 		else {
 			fprintf(stderr,
 				"usage: txload [--once] [--stats] [--jsonl F]\n"
-				"              [--model FILE] [--defer-port N]...\n");
+				"              [--model FILE] [--defer-port N]...\n"
+				"              [--pin]    keep the hooks attached after exit\n"
+				"              [--unpin]  detach pinned hooks and quit\n");
 			return 2;
 		}
 	}
@@ -424,6 +429,23 @@ int main(int argc, char **argv)
 	 * nothing and reports a failure that did not occur.
 	 */
 	setvbuf(stdout, NULL, _IOLBF, 0);
+
+	if (do_unpin) {
+		static const char *names[] = {
+			"file_open", "path_unlink", "bprm_check", "socket_connect",
+			"socket_sendmsg", "egress0", "egress1", "egress2", "egress3",
+		};
+		char path[256];
+		int n = 0;
+
+		for (i = 0; i < (int)(sizeof(names) / sizeof(*names)); i++) {
+			snprintf(path, sizeof(path), "%s/%s", TX_PIN_DIR, names[i]);
+			if (unlink(path) == 0)
+				n++;
+		}
+		printf("txload: unpinned %d link(s)\n", n);
+		return 0;
+	}
 
 	if (preflight())
 		return 1;
@@ -590,6 +612,55 @@ int main(int argc, char **argv)
 			"        to run. Needs CONFIG_NET_XGRESS=y (kernel 6.6+).\n");
 		err = 1;
 		goto out;
+	}
+
+	/*
+	 * Pin the links so the hooks OUTLIVE this process.
+	 *
+	 * A bpf_link is refcounted by the fd that holds it; when txload exits,
+	 * the links drop and every program detaches. That has two costs:
+	 *
+	 *  1. The hooks can only be attached while something is running, so
+	 *     any measurement of "what do the hooks cost" also measures that
+	 *     process. bench_hooks.sh saw +108ns on getpid() -- a syscall with
+	 *     no LSM hook at all -- which is txload draining a ring buffer,
+	 *     not hook overhead.
+	 *  2. Restarting the WAL reader silently disarms the sandbox.
+	 *
+	 * Pinning into TX_PIN_DIR (the contract already names it) keeps them
+	 * attached with no process alive. Unpin with `rm` on those paths, or
+	 * txload --unpin.
+	 */
+	if (do_pin) {
+		char path[256];
+		int pinned = 0;
+
+		mkdir(TX_PIN_DIR, 0700);
+		struct bpf_link *pins[] = {
+			skel->links.tx_file_open, skel->links.tx_path_unlink,
+			skel->links.tx_bprm_check, skel->links.tx_socket_connect,
+			skel->links.tx_socket_sendmsg,
+		};
+		static const char *names[] = {
+			"file_open", "path_unlink", "bprm_check",
+			"socket_connect", "socket_sendmsg",
+		};
+		for (i = 0; i < 5; i++) {
+			if (!pins[i])
+				continue;
+			snprintf(path, sizeof(path), "%s/%s", TX_PIN_DIR, names[i]);
+			unlink(path);
+			if (bpf_link__pin(pins[i], path) == 0)
+				pinned++;
+		}
+		for (i = 0; i < n_links; i++) {
+			snprintf(path, sizeof(path), "%s/egress%d", TX_PIN_DIR, i);
+			unlink(path);
+			if (bpf_link__pin(tcx_links[i], path) == 0)
+				pinned++;
+		}
+		printf("txload: pinned %d link(s) under %s -- the hooks now survive "
+		       "this process\n", pinned, TX_PIN_DIR);
 	}
 
 	printf("txload: 5 LSM hooks + egress suppression attached\n");

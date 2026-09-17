@@ -242,8 +242,12 @@ deadlock-demo:
 	@echo
 	@echo "events -> $(DATA)/deadlock/events.jsonl  (the dashboard renders these)"
 
+# Check, then draw.  The enforcer exists (P4-11); skipping it once produced a
+# figure from a debug-kernel run whose marker had been split out of the CSV by
+# an unquoted comma.
 .PHONY: figures
 figures:
+	$(PY) tools/bench/run.py --check-all $(RESULTS) || true
 	$(PY) tools/bench/plot.py --in $(RESULTS) --out paper/figs
 
 # ---------------------------------------------------------------------

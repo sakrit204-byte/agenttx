@@ -62,22 +62,44 @@ else
 fi
 
 # --- amplification ----------------------------------------------------
-# One byte changed in a file of SIZE bytes. overlayfs copies the whole file
-# up, so the ratio is the file size -- which is the point of measuring it.
+# Bytes landing on disk per byte of logical change.
+#
+# MEASURED DURING THE TRANSACTION, not after. A committed transaction drains
+# its upper layer (src/fs/commit.c), so a du(1) delta taken afterwards sees
+# almost nothing -- the first version of this reported 16 bytes/byte for a
+# one-byte edit of a 4096-byte file, which is impossible: overlayfs copies the
+# whole file up. It was measuring the cleanup.
+#
+# So: hold the transaction open with `txctl session`, measure, then abort.
 if [ -x "$TXCTL" ] && [ -c /dev/agenttx ]; then
 	rm -rf "$BASE/amp"; mkdir -p "$BASE/amp"
 	dd if=/dev/zero of="$BASE/amp/big.bin" bs=1 count="$SIZE" 2>/dev/null
-	before=$(du -sb /var/lib/agenttx 2>/dev/null | cut -f1 || echo 0)
-	"$TXCTL" run --lower "$BASE/amp" -- \
-		sh -c "printf X | dd of=big.bin bs=1 seek=0 conv=notrunc 2>/dev/null; sleep 0.3" \
-		>/dev/null 2>&1 || true
-	after=$(du -sb /var/lib/agenttx 2>/dev/null | cut -f1 || echo 0)
-	delta=$(( after > before ? after - before : 0 ))
-	if [ "$delta" -gt 0 ]; then
-		row "storage_amplification" "bytes_per_byte" "overlay" "1" \
-		    "$delta" "0" "1 logical byte changed in a ${SIZE}B file$NOTES_SUFFIX"
+	chown -R agent "$BASE/amp" 2>/dev/null || true
+	rm -rf /run/agenttx/session-* 2>/dev/null
+
+	( setsid "$TXCTL" session --lower "$BASE/amp" \
+		-- sh -c "printf X | dd of=big.bin bs=1 seek=0 conv=notrunc 2>/dev/null" \
+		>/dev/null 2>&1 & )
+	sleep 4
+
+	d=$(ls -d /run/agenttx/session-* 2>/dev/null | head -1)
+	if [ -n "$d" ]; then
+		tx=${d##*/session-}
+		up=$(du -sb "/var/lib/agenttx/tx-$tx/upper" 2>/dev/null | cut -f1 || echo 0)
+		if [ "${up:-0}" -gt 0 ]; then
+			ratio=$(awk -v u="$up" 'BEGIN { printf "%.1f", u / 1 }')
+			row "storage_amplification" "ratio" "overlay" "1" \
+			    "$ratio" "0" \
+			    "1 logical byte changed in a ${SIZE}B file; upper layer holds ${up}B$NOTES_SUFFIX"
+			row "copied_up_bytes" "bytes" "overlay" "1" "$up" "0" \
+			    "whole-file copy-up for a 1-byte edit$NOTES_SUFFIX"
+		else
+			say "  amplification: upper layer empty; skipping"
+		fi
+		printf abort > "$d/decide" 2>/dev/null || true
+		sleep 2
 	else
-		say "  amplification: no measurable delta (transaction may have been reaped)"
+		say "  amplification: no session appeared; skipping"
 	fi
 fi
 

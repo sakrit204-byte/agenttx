@@ -120,5 +120,13 @@ echo
 echo "kernel:  $KBUILD_OUT/arch/x86/boot/bzImage"
 echo "vmlinux: $KBUILD_OUT/vmlinux   (give this one to gdb)"
 echo "profile: $PROFILE"
-[[ "$PROFILE" = debug ]] && \
+# NOT `[[ ... ]] && echo`: on a perf build the test is false, the && chain
+# returns 1, and that becomes the script's exit status -- so every SUCCESSFUL
+# perf build reported `make: *** Error 1` while producing a perfect kernel.
+if [[ "$PROFILE" = debug ]]; then
 	echo "NOTE:    KASAN is on. Do not take benchmark numbers from this kernel."
+else
+	echo "NOTE:    KASAN and lockdep are OFF. This is the kernel the paper's"
+	echo "         numbers come from."
+fi
+exit 0

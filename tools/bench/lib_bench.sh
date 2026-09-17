@@ -44,9 +44,20 @@ stats() {
 # cold caches, cold BPF JIT, demand paging of the binary itself.
 drop_warmup() { tail -n +$(( $1 + 1 )); }
 
-row() {  # row <metric> <unit> <config> <n> <value> <stddev> <notes>
-	printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
-		"$STREAM" "$FRAGMENT" "$1" "$2" "$3" "$4" "$5" "$6" "$7"
+# row <metric> <unit> <config> <n> <value> <stddev> <notes>
+#
+# `notes` is QUOTED, and that is not cosmetic. A note reading
+# "getpid(), no AgentTx involvement DEBUG-KERNEL-NOT-PAPER-GRADE" contains a
+# comma; unquoted it splits into two columns, the DEBUG-KERNEL marker lands
+# in a column no reader looks at, and plot.py cheerfully draws a figure from
+# numbers that measured KASAN. That happened. The guard was defeated by
+# punctuation.
+#
+# Embedded double quotes are doubled, per RFC 4180.
+row() {
+	local notes=${7//\"/\"\"}
+	printf '%s,%s,%s,%s,%s,%s,%s,%s,"%s"\n' \
+		"$STREAM" "$FRAGMENT" "$1" "$2" "$3" "$4" "$5" "$6" "$notes"
 }
 
 header() { echo "stream,fragment,metric,unit,config,n,value,stddev,notes"; }
