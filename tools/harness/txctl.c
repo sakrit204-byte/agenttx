@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <sched.h>
 #include <sys/mount.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -616,11 +617,35 @@ static int drop_to(const char *user)
 	return 0;
 }
 
+/*
+ * How long a session may go unwatched before it fails closed. Long enough to
+ * survive a UI restart or a slow poll, short enough that a forgotten window
+ * does not pin the module for an hour.
+ */
+#define TX_WATCH_GRACE_S	90
+
+/*
+ * Overridable so the test does not have to sit through 90 seconds. Tests
+ * only -- nothing in the normal path sets it.
+ */
+static long tx_watch_grace(void)
+{
+	const char *e = getenv("AGENTTX_WATCH_GRACE_S");
+	long v;
+
+	if (!e || !*e)
+		return TX_WATCH_GRACE_S;
+	v = strtol(e, NULL, 10);
+	return (v > 0) ? v : TX_WATCH_GRACE_S;
+}
+
 static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
 		       const char *lower, const char *as_user, char **argv)
 {
 	int to_holder[2], to_parent[2];
-	char dir[256], path[512], buf[64];
+	char dir[256], path[512], watch[512], buf[64];
+	int seen_watcher = 0;
+	time_t last_watch = 0;
 	tx_id_t tx = TX_ID_NONE;
 	pid_t holder;
 	int status = 0, i, decided = 0, commit = 0;
@@ -743,8 +768,10 @@ static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
 	 * human looks at the diff.
 	 */
 	snprintf(path, sizeof(path), "%s/decide", dir);
+	snprintf(watch, sizeof(watch), "%s/watch", dir);
 	for (i = 0; i < 60 * 60 * 20; i++) {	/* up to ~1h at 50ms */
 		FILE *f;
+		struct stat wst;
 
 		/*
 		 * If the session directory is gone, nobody can ever decide.
@@ -759,6 +786,47 @@ static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
 			fprintf(stderr,
 				"txctl: session directory %s vanished; aborting\n",
 				dir);
+			break;
+		}
+
+		/*
+		 * If a watcher was here and has stopped, nobody is going to
+		 * decide either.
+		 *
+		 * The directory-vanished check above only catches a tidy
+		 * teardown. The common case is untidy: someone opens the
+		 * desktop app, starts a task, and closes the window on the
+		 * review screen. The directory stays, so this loop used to
+		 * run out its full hour holding /dev/agenttx open and pinning
+		 * the module -- observed twice, and the second time the next
+		 * test silently ran against the OLD module because rmmod had
+		 * failed.
+		 *
+		 * The UI touches <dir>/watch on every poll (about 1 Hz). A
+		 * watch file that has gone stale means the window is gone.
+		 * NO watch file at all means nobody was ever watching, which
+		 * is the plain `txctl session` case from a terminal -- that
+		 * keeps the full window, because a person at a shell is a
+		 * legitimate decider who leaves no heartbeat.
+		 */
+		if (stat(watch, &wst) == 0) {
+			seen_watcher = 1;
+			last_watch = wst.st_mtime;
+		}
+		/*
+		 * Age of the last touch, NOT whether the file is there.
+		 *
+		 * The first version had this as the `else` of the stat above,
+		 * which never fired: a closed window leaves its watch file
+		 * behind, so stat() kept succeeding and the staleness test was
+		 * unreachable. It only triggered if someone deleted the file,
+		 * which nothing does. tests/p2/t04_watchdog.sh caught it.
+		 */
+		if (seen_watcher &&
+		    time(NULL) - last_watch > tx_watch_grace()) {
+			fprintf(stderr,
+				"txctl: no watcher for %lds; aborting tx=%llu\n",
+				tx_watch_grace(), (unsigned long long)tx);
 			break;
 		}
 

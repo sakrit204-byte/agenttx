@@ -110,6 +110,7 @@ run_test 1 tests/p1/t08_kfunc.sh
 run_test 1 tests/p1/t11_waitfor.sh
 run_test 1 tests/p2/t02_abort.sh
 run_test 1 tests/p2/t03_commit.sh
+run_test 1 tests/p2/t04_watchdog.sh
 
 # --- tier 2: BPF LSM attached ------------------------------------------
 echo

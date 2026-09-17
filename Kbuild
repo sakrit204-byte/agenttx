@@ -65,38 +65,40 @@ endif
 # The BPF programs live in src/bpf/ and are loaded from userspace; what
 # lands in the module is the kernel-side half that owns the ring and the
 # flush path.
-# NOT YET WRITTEN.  src/bpf/{wal_kern,flush_kern}.c do not exist, so
-# STUB_EFF=0 has never built -- it failed with a bare "No rule to make
-# target", which reads like a broken checkout rather than an unfinished
-# fragment.  Say so instead.
+# VESTIGIAL.  src/bpf/{wal_kern,flush_kern}.c were never written and are not
+# going to be: P3-09 shipped the flush path in BPF plus userspace instead,
+# because BPF maps are userspace-managed and building sk_buffs in-kernel buys
+# nothing (see tracker/master.csv P3-09, status done).  What survived here
+# was a stale object list, so STUB_EFF=0 failed with a bare "No rule to make
+# target" that reads like a broken checkout.
 #
-# This is the MODULE-RESIDENT half only: the ring owner and the flush path.
-# The interception itself is real and running -- src/bpf/agenttx.bpf.c, five
-# LSM hooks plus tcx/egress, loaded from userspace by txload.
+# So "eff=stub" in the load banner means the MODULE-RESIDENT ring/flush half
+# is a stub, which is the design.  The interception itself is real and
+# running: src/bpf/agenttx.bpf.c, five LSM hooks plus tcx/egress, loaded by
+# txload.  Do not read it as "nothing is intercepting".
 ifeq ($(STUB_EFF),1)
 agenttx-y += src/stub/tx_eff_stub.o
 ccflags-y += -DCONFIG_AGENTTX_STUB_EFF=1
 else
-$(error STUB_EFF=0 is not implemented: src/bpf/wal_kern.c and \
-src/bpf/flush_kern.c are unwritten (fragments P3-09/P3-10). The BPF-side \
-interception is real and unaffected; only the in-module ring/flush half is \
-stubbed. Build with STUB_EFF=1.)
+$(error STUB_EFF=0 does not exist: the effect path lives in BPF and \
+userspace by design (P3-09), not in a module-resident wal_kern.o. The \
+interception is real either way. Build with STUB_EFF=1.)
 endif
 
 # --- P4: kernel-side inference --------------------------------------
 # The forward pass itself is a BPF program (src/policy/infer.bpf.c); this is
 # the in-module fallback and the rule-table baseline both hooks call through.
-# NOT YET WRITTEN, same as STUB_EFF above: src/policy/classify.c is the
-# in-module FALLBACK classifier.  The classifier that actually decides is the
-# quantized tree in src/policy/infer.h, compiled into the BPF program and
-# already running.
+# Same shape as STUB_EFF above.  src/policy/classify.c would be an in-module
+# FALLBACK classifier; it is not a tracked fragment and nothing needs it.
+# The classifier that actually decides is the quantized tree in
+# src/policy/infer.h, compiled into the BPF program and already running.
 ifeq ($(STUB_CLASSIFY),1)
 agenttx-y += src/stub/tx_classify_stub.o
 ccflags-y += -DCONFIG_AGENTTX_STUB_CLASSIFY=1
 else
-$(error STUB_CLASSIFY=0 is not implemented: src/policy/classify.c is \
-unwritten (fragment P4-03). The in-BPF tree classifier is real and \
-unaffected. Build with STUB_CLASSIFY=1.)
+$(error STUB_CLASSIFY=0 does not exist: there is no in-module classifier. \
+The in-BPF tree classifier is real and unaffected. Build with \
+STUB_CLASSIFY=1.)
 endif
 
 # tx_core_stub is NOT linked here: src/core/ is present, so tx_current_id()

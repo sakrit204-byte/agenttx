@@ -308,6 +308,13 @@ set -u
 for d in /run/agenttx/session-*; do
   [ -d "$d" ] || continue
   tx=${d##*/session-}
+  # Heartbeat. `txctl session` holds the transaction open waiting for a
+  # human, and if the window that was going to decide simply closes, it used
+  # to sit out its full one-hour window with /dev/agenttx open -- which pins
+  # the module, so rmmod fails with "Module agenttx is in use" and the reason
+  # is three directories away. Touching this file every poll lets txctl tell
+  # "nobody is watching any more" from "nobody has decided yet".
+  touch "$d/watch" 2>/dev/null || true
   echo "---SESSION $tx---"
   for k in status exit lower cmd; do
     printf '%s=' "$k"; head -c 400 "$d/$k" 2>/dev/null | tr -d '
