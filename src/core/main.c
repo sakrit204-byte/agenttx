@@ -143,13 +143,22 @@ static int __init agenttx_init(void)
 	if (tx_kfunc_register())
 		pr_warn("kfuncs unavailable; BPF hooks cannot gate on transaction state\n");
 
-	pr_info("loaded, abi %u, %s providers, %s\n",
+	/*
+	 * Name each provider, not one global bit.
+	 *
+	 * Kbuild lets the three providers be stubbed INDEPENDENTLY
+	 * (STUB=1 STUB_FS=0 is the ordinary P2 development build), but this
+	 * line used to print CONFIG_AGENTTX_STUB alone.  So the usual build
+	 * announced "stub providers" while running the real overlayfs
+	 * storage, and anything reading the banner to decide what it was
+	 * looking at -- tools/ui/guest.py did exactly that -- got the wrong
+	 * answer for two of the three.
+	 */
+	pr_info("loaded, abi %u, fs=%s eff=%s classify=%s, %s\n",
 		AGENTTX_ABI_VERSION,
-#ifdef CONFIG_AGENTTX_STUB
-		"stub",
-#else
-		"real",
-#endif
+		IS_ENABLED(CONFIG_AGENTTX_STUB_FS)       ? "stub" : "real",
+		IS_ENABLED(CONFIG_AGENTTX_STUB_EFF)      ? "stub" : "real",
+		IS_ENABLED(CONFIG_AGENTTX_STUB_CLASSIFY) ? "stub" : "real",
 		AGENTTX_DEV_PATH);
 	return 0;
 

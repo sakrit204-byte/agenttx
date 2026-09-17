@@ -52,6 +52,7 @@ STUB_CLASSIFY ?= $(STUB)
 # --- P2: copy-on-write storage --------------------------------------
 ifeq ($(STUB_FS),1)
 agenttx-y += src/stub/tx_fs_stub.o
+ccflags-y += -DCONFIG_AGENTTX_STUB_FS=1
 else
 agenttx-y += src/fs/mount.o
 agenttx-y += src/fs/abort.o
@@ -64,20 +65,38 @@ endif
 # The BPF programs live in src/bpf/ and are loaded from userspace; what
 # lands in the module is the kernel-side half that owns the ring and the
 # flush path.
+# NOT YET WRITTEN.  src/bpf/{wal_kern,flush_kern}.c do not exist, so
+# STUB_EFF=0 has never built -- it failed with a bare "No rule to make
+# target", which reads like a broken checkout rather than an unfinished
+# fragment.  Say so instead.
+#
+# This is the MODULE-RESIDENT half only: the ring owner and the flush path.
+# The interception itself is real and running -- src/bpf/agenttx.bpf.c, five
+# LSM hooks plus tcx/egress, loaded from userspace by txload.
 ifeq ($(STUB_EFF),1)
 agenttx-y += src/stub/tx_eff_stub.o
+ccflags-y += -DCONFIG_AGENTTX_STUB_EFF=1
 else
-agenttx-y += src/bpf/wal_kern.o
-agenttx-y += src/bpf/flush_kern.o
+$(error STUB_EFF=0 is not implemented: src/bpf/wal_kern.c and \
+src/bpf/flush_kern.c are unwritten (fragments P3-09/P3-10). The BPF-side \
+interception is real and unaffected; only the in-module ring/flush half is \
+stubbed. Build with STUB_EFF=1.)
 endif
 
 # --- P4: kernel-side inference --------------------------------------
 # The forward pass itself is a BPF program (src/policy/infer.bpf.c); this is
 # the in-module fallback and the rule-table baseline both hooks call through.
+# NOT YET WRITTEN, same as STUB_EFF above: src/policy/classify.c is the
+# in-module FALLBACK classifier.  The classifier that actually decides is the
+# quantized tree in src/policy/infer.h, compiled into the BPF program and
+# already running.
 ifeq ($(STUB_CLASSIFY),1)
 agenttx-y += src/stub/tx_classify_stub.o
+ccflags-y += -DCONFIG_AGENTTX_STUB_CLASSIFY=1
 else
-agenttx-y += src/policy/classify.o
+$(error STUB_CLASSIFY=0 is not implemented: src/policy/classify.c is \
+unwritten (fragment P4-03). The in-BPF tree classifier is real and \
+unaffected. Build with STUB_CLASSIFY=1.)
 endif
 
 # tx_core_stub is NOT linked here: src/core/ is present, so tx_current_id()

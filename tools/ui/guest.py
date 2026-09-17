@@ -84,12 +84,23 @@ echo "---MODULE---"
 lsmod 2>/dev/null | awk '$1=="agenttx"{print "loaded "$2" "$3}' || true
 [ -c /dev/agenttx ] && echo "dev yes" || echo "dev no"
 echo "---MODE---"
-dmesg 2>/dev/null | grep -o 'loaded, abi [0-9]*, [a-z]* providers' | tail -1 || true
+dmesg 2>/dev/null | grep -oE 'loaded, abi [0-9]+, fs=[a-z]+ eff=[a-z]+ classify=[a-z]+' | tail -1 || true
 dmesg 2>/dev/null | grep -c 'agenttx/fs-stub:' | sed 's/^/fsstub /' || true
 echo "---STAT---"
 "$R/tools/harness/txctl" stat --json 2>/dev/null || echo '{}'
 echo "---TXDIRS---"
-for d in /var/lib/agenttx/tx-*; do
+# Pick the newest N transaction directories ONCE and reuse the list below.
+#
+# THE BUG THIS FIXES. The three loops that follow each expanded
+# /var/lib/agenttx/tx-* and ran find(1) per directory. The module creates one
+# skeleton directory per transaction ever opened and never unlinks it -- abort
+# and commit drain upper/ but leave the shell -- so this box had accumulated
+# 13,704 of them. Three full walks over 54,869 entries took longer than the
+# 30s ssh timeout, so snapshot() returned its zero-value dict and the "Under
+# the hood" Kernel state tab rendered permanently blank. The panel only ever
+# shows 14 rows; walking all of them was never useful.
+TXD=$(ls -1dt /var/lib/agenttx/tx-* 2>/dev/null | head -20)
+for d in $TXD; do
   [ -d "$d" ] || continue
   id=${d##*/tx-}
   up=$(find "$d/upper" -mindepth 1 2>/dev/null | wc -l)
@@ -97,7 +108,7 @@ for d in /var/lib/agenttx/tx-*; do
   echo "$id $up $lo"
 done
 echo "---UPPER---"
-for d in /var/lib/agenttx/tx-*; do
+for d in $TXD; do
   [ -d "$d/upper" ] || continue
   id=${d##*/tx-}
   find "$d/upper" -mindepth 1 2>/dev/null | head -60 | while read -r f; do
@@ -109,7 +120,7 @@ for d in /var/lib/agenttx/tx-*; do
   done
 done
 echo "---LOWER---"
-for d in /var/lib/agenttx/tx-*; do
+for d in $TXD; do
   L=$(readlink "$d/lower" 2>/dev/null) || continue
   [ -d "$L" ] || continue
   id=${d##*/tx-}
@@ -150,6 +161,10 @@ echo "---END---"
         rc, so, se = self.run("bash -s", timeout=25) if False else \
             self._run_stdin(script)
         if rc != 0 and not so:
+            # `reachable` means "the snapshot came back", not "the host
+            # pinged". Leaving it True here rendered a panel of None rows
+            # with the real error nowhere on screen.
+            out["reachable"] = False
             out["error"] = se.strip() or f"snapshot exited {rc}"
             return out
 
@@ -170,9 +185,17 @@ echo "---END---"
                           if l.startswith("loaded") and len(l.split()) > 2), "0"),
         }
         for l in sec.get("MODE", []):
-            if "providers" in l:
-                out["mode"] = l.split(",")[-1].strip()
-            if l.startswith("fsstub"):
+            # "loaded, abi 2, fs=real eff=stub classify=stub"
+            if "fs=" in l:
+                out["mode"] = l.split(",", 2)[-1].strip()
+                for part in out["mode"].split():
+                    k, _, v = part.partition("=")
+                    if k in ("fs", "eff", "classify"):
+                        out[f"{k}_is_stub"] = (v == "stub")
+            if l.startswith("fsstub") and "fs_is_stub" not in out:
+                # Fallback for a module built before the banner named each
+                # provider. Counts over the whole dmesg ring, so it mixes
+                # module loads -- the banner is authoritative when present.
                 out["fs_is_stub"] = l.split()[1] != "0"
 
         try:

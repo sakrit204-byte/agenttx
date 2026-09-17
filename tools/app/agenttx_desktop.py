@@ -182,34 +182,70 @@ class Poller(QThread):
 
 class Task(QObject):
     """Run one blocking guest call off the GUI thread."""
-    done = pyqtSignal(object)
 
-    def __init__(self, fn, *a):
+    # Carries (callback, result) so the GUI thread knows what to do with it.
+    done = pyqtSignal(object, object)
+
+    def __init__(self, fn, args, cb):
         super().__init__()
-        self.fn, self.a = fn, a
+        self.fn, self.args, self.cb = fn, args, cb
 
     def go(self):
         try:
-            self.done.emit(self.fn(*self.a))
+            self.done.emit(self.cb, self.fn(*self.args))
         except Exception as e:
-            self.done.emit(e)
+            self.done.emit(self.cb, e)
+
+
+_WORKERS: list = []
 
 
 def run_async(parent, fn, *args, then=None):
-    th = QThread(parent)
-    t = Task(fn, *args)
+    """
+    Run `fn(*args)` on a worker thread and deliver the result ON THE GUI
+    THREAD.
+
+    THE BUG THIS EXISTS TO AVOID. The first version connected the completion
+    signal to a plain closure. A plain callable has no thread affinity, so Qt
+    used a direct connection and the closure ran in the WORKER thread -- which
+    then touched QWidgets. Updating a widget from a non-GUI thread is
+    undefined behaviour in Qt, and here it did the quietest possible thing:
+    nothing at all. The "Under the hood" panel rendered its tabs and stayed
+    permanently blank, with no error anywhere.
+
+    The fix is a real receiver: `parent` is a QObject living in the GUI
+    thread, so a QueuedConnection to one of its methods is delivered by the
+    GUI event loop. The callback rides along in the signal.
+    """
+    # NOT parented to `parent`. A QThread destroyed while running aborts the
+    # process, and Qt destroys a parent's children -- so on close, any worker
+    # still blocked in an ssh round trip (up to 30s) would take the app down
+    # with "QThread: Destroyed while thread is still running". Ownership is a
+    # module-level registry instead; the interpreter outlives the window.
+    th = QThread()
+    t = Task(fn, args, then)
     t.moveToThread(th)
     th.started.connect(t.go)
-
-    def finish(res):
-        if then:
-            then(res)
-        th.quit()
-
-    t.done.connect(finish)
+    t.done.connect(parent._task_done, Qt.ConnectionType.QueuedConnection)
+    t.done.connect(lambda *_: th.quit())
     th.finished.connect(th.deleteLater)
-    parent._keepalive = getattr(parent, "_keepalive", [])
-    parent._keepalive.append((th, t))
+
+    # Hold a reference or Python collects the QThread mid-run.
+    #
+    # Removed when the thread finishes rather than pruned on the next call:
+    # deleteLater() destroys the C++ object, and asking a destroyed QThread
+    # isRunning() raises "wrapped C/C++ object has been deleted" from inside
+    # an unrelated later call. Let the thread say when it is done.
+    entry = (th, t)
+    _WORKERS.append(entry)
+
+    def _reap():
+        try:
+            _WORKERS.remove(entry)
+        except ValueError:
+            pass
+
+    th.finished.connect(_reap)
     th.start()
     return th
 
@@ -334,11 +370,12 @@ class ReviewView(QWidget):
         colour, word = STATUS.get(self.status, ("#8b9aad", self.status or "?"))
 
         if self.status == "running":
-            self.headline.setText("The agent is working…")
+            self.headline.setText("The agent is working on it…")
             self.sub.setText(
-                "It is running with no permission prompts, because it cannot "
-                "do any harm yet — everything it writes is going into a "
-                "sandbox layer. You will decide once, when it finishes.")
+                "It is deciding what to run and running it, with no "
+                "permission prompts — it cannot do any harm yet, because "
+                "everything it writes is going into a sandbox layer. "
+                "You decide once, when it is done.")
         elif self.status == "awaiting-decision":
             self.headline.setText(head)
             self.sub.setText(tail)
@@ -363,7 +400,8 @@ class ReviewView(QWidget):
             o = card()
             ov = QVBoxLayout(o)
             ov.setContentsMargins(13, 11, 13, 11)
-            ov.addWidget(lab("What the agent said", bold=True))
+            ov.addWidget(lab("What the agent did — its own commands and output",
+                             bold=True))
             t = QPlainTextEdit()
             t.setReadOnly(True)
             t.setPlainText(output[-6000:])
@@ -471,6 +509,17 @@ class HoodView(QWidget):
                     "  during capture) and compensable needs a declared registry.", ""]
         return "\n".join(out)
 
+    @staticmethod
+    def _prov(snap, key, real):
+        """Say 'unknown' when the banner did not say, instead of guessing 'stub'.
+
+        The old row read `'real' if fs_is_stub is False else 'stub'`, so a
+        snapshot that simply could not tell -- an older module, an unparsed
+        banner -- displayed a confident "stub". Three states, three answers.
+        """
+        v = snap.get(f"{key}_is_stub")
+        return real if v is False else "stub" if v is True else "unknown"
+
     def update_live(self, snap):
         if not snap.get("reachable"):
             self.kernel.setPlainText("no link to the sandbox VM\n\n"
@@ -483,7 +532,15 @@ class HoodView(QWidget):
             "SANDBOX KERNEL", "=" * 58,
             f"  module loaded            {m.get('loaded')}",
             f"  /dev/agenttx             {m.get('dev')}",
-            f"  storage provider         {'real (src/fs)' if snap.get('fs_is_stub') is False else 'stub'}",
+            f"  storage provider         {self._prov(snap, 'fs', 'real (src/fs)')}",
+            # These two name the MODULE-RESIDENT half only. The interception
+            # and the classifier that actually decide live in the BPF program
+            # (rows above: "BPF LSM active", "WAL streaming"), and they are
+            # real. Labelling these bare "effect interception: stub" would
+            # read as "nothing is intercepting", which is the opposite of
+            # what is true.
+            f"  in-module WAL/flush      {self._prov(snap, 'eff', 'real')}  (BPF half is real)",
+            f"  in-module classifier     {self._prov(snap, 'classify', 'real')}  (BPF tree is real)",
             f"  BPF LSM active           {b.get('lsm')}",
             f"  module BTF (kfuncs)      {b.get('modbtf')}",
             f"  WAL streaming            {b.get('running')}",
@@ -554,13 +611,15 @@ class Main(QMainWindow):
         self.dirin = QLineEdit("/tmp/work")
         self.dirin.setObjectName("DirInput")
         self.dirin.setMaximumWidth(230)
-        self.dirin.setToolTip("The folder the agent is allowed to change")
+        self.dirin.setToolTip(
+            "The only folder the agent is allowed to change.\n"
+            "Everything it writes here goes into a sandbox layer first.")
         self.taskin = QLineEdit()
         self.taskin.setObjectName("TaskInput")
         self.taskin.setPlaceholderText(
-            "A command to run in the sandbox…  e.g. sh -c 'echo hi > note.txt'")
+            "What should the agent do?   e.g. add a README explaining this folder")
         self.taskin.returnPressed.connect(self.dispatch)
-        self.go = QPushButton("Run agent")
+        self.go = QPushButton("Give it the task")
         self.go.setObjectName("Dispatch")
         self.go.clicked.connect(self.dispatch)
         row.addWidget(self.dirin)
@@ -568,13 +627,13 @@ class Main(QMainWindow):
         row.addWidget(self.go)
         hv.addLayout(row)
         hv.addWidget(lab(
-            "The agent runs with no permission prompts — it cannot do harm "
-            "until you press Keep.   Prefix with <b>$</b> to run a shell "
-            "command instead (no model, no usage).", "Muted", wrap=True))
-        hv.addWidget(lab(
-            "Runs as a shell command — no API, no cost.  Prefix with "
-            "<b>ai:</b> to run Claude Code instead, which bills the account "
-            "the sandbox is signed into.", "Muted", wrap=True))
+            "You describe the task; <b>the agent decides what commands to "
+            "run</b>. It runs with no permission prompts, because it cannot "
+            "do any harm until you press Keep — every file it touches lands "
+            "in a sandbox layer first. "
+            "<span style='color:#4b5666'>(A leading <b>$</b> runs one shell "
+            "command directly instead, using no model.)</span>",
+            "Muted", wrap=True))
         rv.addWidget(hdr)
 
         # --- body -----------------------------------------------------
@@ -584,7 +643,7 @@ class Main(QMainWindow):
         sv = QVBoxLayout(side)
         sv.setContentsMargins(9, 12, 9, 12)
         sv.setSpacing(7)
-        sv.addWidget(lab("SESSIONS", "Muted"))
+        sv.addWidget(lab("TASKS", "Muted"))
         self.list = QListWidget()
         self.list.currentRowChanged.connect(self.pick)
         sv.addWidget(self.list, 1)
@@ -610,6 +669,14 @@ class Main(QMainWindow):
         self.hoodtimer = QTimer(self)
         self.hoodtimer.timeout.connect(self.refresh_hood)
         self.hoodtimer.start(4000)
+
+    def _task_done(self, cb, result):
+        """Runs on the GUI thread. The only place a worker's result touches a widget."""
+        if cb:
+            try:
+                cb(result)
+            except Exception as e:
+                print(f"agenttx: callback failed: {e}", file=sys.stderr)
 
     # ------------------------------------------------------------ actions
     def dispatch(self):
@@ -638,7 +705,11 @@ class Main(QMainWindow):
             # transaction every write lands in a copy-on-write layer and nothing
             # is real until a human presses Keep. Asking per action would be
             # asking twice.
-            cmd = "claude --dangerously-skip-permissions -p '" + prompt + "'"
+            # </dev/null: without it Claude Code waits 3s for piped stdin
+            # and prints a warning into the session output. The agent has no
+            # stdin here -- its instructions are the prompt.
+            cmd = ("claude --dangerously-skip-permissions -p '" + prompt
+                   + "' < /dev/null")
         else:
             cmd = "sh -c '" + task.replace("'", "'\\''") + "'"
 
@@ -693,7 +764,7 @@ class Main(QMainWindow):
             wl.setContentsMargins(11, 9, 11, 9)
             wl.setSpacing(3)
             top = QHBoxLayout()
-            top.addWidget(lab(f"Session {s.get('tx')}", bold=True))
+            top.addWidget(lab(f"Task {s.get('tx')}", bold=True))
             top.addStretch(1)
             p = pill(word, colour)
             top.addWidget(p)
@@ -714,8 +785,20 @@ class Main(QMainWindow):
                 if s.get("tx") == keep:
                     self.list.setCurrentRow(i)
                     return
-        if self.sessions:
-            self.list.setCurrentRow(0)
+        if not self.sessions:
+            return
+        # Open on something worth looking at. Sessions are newest-first, but
+        # the newest may have changed nothing -- landing on "The agent changed
+        # nothing" when a session below it is waiting on a real decision is a
+        # bad first frame. Prefer: awaiting a decision AND has changes.
+        for want in (lambda s: s.get("status") == "awaiting-decision"
+                               and int(s.get("changed") or 0) > 0,
+                     lambda s: int(s.get("changed") or 0) > 0,
+                     lambda s: True):
+            for i, s in enumerate(self.sessions):
+                if want(s):
+                    self.list.setCurrentRow(i)
+                    return
 
     def pick(self, row):
         if 0 <= row < len(self.sessions):
@@ -739,8 +822,26 @@ class Main(QMainWindow):
         run_async(self, fetch, self.selected, then=got)
 
     def closeEvent(self, e):
+        """
+        Stop every worker before the window goes.
+
+        An ssh round trip takes 50-200ms, so there is almost always one in
+        flight. Destroying its QThread while it runs aborts the process --
+        "QThread: Destroyed while thread is still running" and a core dump on
+        exit, which looks exactly like a crash in the app.
+        """
+        self.hoodtimer.stop()
         self.poll.stop()
-        self.poll.wait(2000)
+        self.poll.wait(3000)
+        for th, _t in list(_WORKERS):
+            try:
+                th.quit()
+                th.wait(2000)
+            except RuntimeError:
+                pass        # already gone; nothing to wait for
+        # Anything still blocked in an ssh call keeps its reference in
+        # _WORKERS and is simply left to finish. It is not parented to this
+        # window, so nothing destroys it underneath itself.
         e.accept()
 
 
