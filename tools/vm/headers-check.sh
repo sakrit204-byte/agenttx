@@ -175,6 +175,24 @@ int main(void)
 	CHECK(_IOC_DIR(TX_IOC_COMMIT) == (_IOC_READ|_IOC_WRITE), "TX_IOC_COMMIT is not _IOWR");
 	CHECK(_IOC_TYPE(TX_IOC_BEGIN) == AGENTTX_IOC_MAGIC, "ioctl magic drifted");
 
+	/* --- wait-for graph (contract change: abi 2) --------------------- */
+	{
+		static const char *wt[] = TX_WAIT_NAMES;
+
+		CHECK(sizeof(wt)/sizeof(*wt) == TX_WAIT_MAX, "TX_WAIT_NAMES != TX_WAIT_MAX");
+	}
+	/* The edge struct crosses the ioctl boundary; keep it fixup-free. */
+	CHECK(sizeof(struct tx_wait_edge) % 8 == 0, "tx_wait_edge is not 8-byte-multiple sized");
+	CHECK(_Alignof(struct tx_wait_edge) == 8,   "tx_wait_edge alignment is not 8");
+	CHECK(_IOC_DIR(TX_IOC_WAIT) == (_IOC_READ|_IOC_WRITE), "TX_IOC_WAIT is not _IOWR");
+	CHECK(_IOC_TYPE(TX_IOC_WAIT) == AGENTTX_IOC_MAGIC, "TX_IOC_WAIT magic drifted");
+	CHECK(_IOC_NR(TX_IOC_WAIT) != _IOC_NR(TX_IOC_SUPERVISOR) &&
+	      _IOC_NR(TX_IOC_WAIT) != _IOC_NR(TX_IOC_ABI) &&
+	      _IOC_NR(TX_IOC_UNWAIT) != _IOC_NR(TX_IOC_WAIT),
+	      "ioctl numbers collide");
+	/* TX_REASON_DEADLOCK must be inside the range ioctl.c validates. */
+	CHECK(TX_REASON_DEADLOCK < TX_REASON_MAX, "TX_REASON_DEADLOCK outside the enum");
+
 	/* Fail-closed threshold must sit inside the confidence range, or
 	   tx_class_final() becomes either a no-op or a permanent deny. */
 	CHECK(TX_CONFIDENCE_MIN > 0 && TX_CONFIDENCE_MIN <= 255,

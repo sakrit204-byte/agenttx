@@ -1,8 +1,10 @@
 # Concurrency, conflict and deadlock in AgentTx
 
-Status: **design**. Nothing here is implemented in the kernel yet; the
-simulator (`tools/harness/deadlock.py`) implements the model and is what the
-demo runs. New fragments are proposed at the bottom.
+Status: **implemented in the kernel** as of 2026-09-17 --- `src/core/waitfor.c`,
+contract abi 2, `tests/p1/t11_waitfor.sh` (17 assertions, KASAN+lockdep clean).
+`tools/harness/deadlock.py` remains as the model: it explores victim policies
+across scenarios far faster than booting a VM, and every event it emits still
+carries `sim: true`.
 
 ---
 
@@ -161,7 +163,63 @@ axis PROPOSAL.md already names.
 
 ---
 
-## 6. Proposed fragments
+## 6. Fragments --- DONE
+
+| id | what | where |
+|---|---|---|
+| P1-15 | wait-for graph, three edge kinds | `src/core/waitfor.c` |
+| P1-16 | cycle detection on edge insert | `path_back()`, iterative DFS |
+| P1-17 | victim selection; refuses DOOMED | `choose_victim()` |
+| P1-18 | reports the all-DOOMED cycle | `-EDEADLK` to userspace |
+
+### What changed between the model and the kernel
+
+**Detection is edge-specific, not "find any cycle".** The model searched the
+whole graph. In the kernel that is wrong in a way that only appears once the
+graph has been used: an *unresolvable* cycle stays in the graph by definition
+--- nothing can be aborted to break it --- so every later insert rediscovered
+it and returned `-EDEADLK` to callers whose own edge was fine. One stuck cycle
+poisoned every subsequent wait. `path_back()` answers the question the caller
+actually asked: *does MY wait deadlock?*
+
+**The DFS is iterative.** The kernel stack is 16 KiB and the graph's depth is
+bounded only by how many transactions a caller chooses to chain, so a
+recursive DFS is a stack overflow reachable from userspace.
+
+**Both ends must be live transactions.** An edge naming a transaction that
+does not exist can never be satisfied and never be dropped, so the graph
+accumulates permanent garbage and a cycle through it is a phantom deadlock
+between parties that were never there. `-ESRCH`.
+
+**The abort is deferred to a workqueue.** Victim selection happens under
+`tx_edges_lock`; `tx_do_abort()` calls into P2 and P3 and both sleep. Same
+shape as the process-death path, for the same reason.
+
+### Measured, in the kernel
+
+```
+DEADLOCK: 2 transactions in a cycle [escalate output ]
+  tx=1 -> tx=2
+  tx=2 -> tx=1
+  victim tx=2 (policy=least-severe, 2 of 2 abortable, 0 doomed)
+  tx=2 ABORT reason=8 files_dropped=1 effects_dropped=3
+```
+
+and, with both transactions doomed by the **in-kernel classifier** calling an
+outbound send irrevocable:
+
+```
+DEADLOCK IS UNRESOLVABLE: all 2 transactions are DOOMED
+  Abort is the preemption primitive and a DOOMED transaction
+  cannot be aborted -- the effects are already emitted.
+```
+
+`-EDEADLK` reaches userspace, because a caller about to sleep on that wait
+must be told that sleeping would hang.
+
+---
+
+## 7. Still proposed
 
 These are **proposals**, not merged rows. The write-set fragments already
 exist and only change priority; the rest are new.

@@ -145,6 +145,13 @@ out:
 	if (n_effects)
 		*n_effects = effects;
 
+	/*
+	 * Drop every wait-for edge touching this transaction. Leaving one
+	 * behind lets a finished transaction hold a cycle open forever, and
+	 * the detector then reports a deadlock between parties one of which
+	 * no longer exists.
+	 */
+	tx_wait_drop_all(ctx->tx_id);
 	tx_ctx_unlink(ctx);
 	return ret;
 }
@@ -208,6 +215,7 @@ int tx_do_abort(struct tx_ctx *ctx, u32 reason, u64 *n_effects, u64 *n_files)
 	if (n_effects)
 		*n_effects = effects;
 
+	tx_wait_drop_all(ctx->tx_id);
 	tx_ctx_unlink(ctx);
 	return eff_ret ? eff_ret : fs_ret;
 }

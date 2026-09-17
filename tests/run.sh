@@ -107,6 +107,7 @@ run_test 1 tests/p1/t04_state.sh
 run_test 1 tests/p1/t05_commit.sh
 run_test 1 tests/p1/t06_kill.sh
 run_test 1 tests/p1/t08_kfunc.sh
+run_test 1 tests/p1/t11_waitfor.sh
 run_test 1 tests/p2/t02_abort.sh
 run_test 1 tests/p2/t03_commit.sh
 

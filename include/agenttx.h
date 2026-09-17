@@ -43,7 +43,13 @@
  * loader refuses a weight blob whose version it does not recognise.  This
  * is what stops a half-migrated tree failing in a way nobody can read.
  */
-#define AGENTTX_ABI_VERSION	1u
+/*
+ * Bumped to 2 by the wait-for-graph contract change (P1-15..P1-18):
+ * enum tx_wait_kind, struct tx_wait_edge, TX_IOC_WAIT/UNWAIT and
+ * TX_REASON_DEADLOCK.  A supervisor built against abi 1 will be refused
+ * rather than silently misreading an edge.
+ */
+#define AGENTTX_ABI_VERSION	2u
 
 #define AGENTTX_DEV_NAME	"agenttx"
 #define AGENTTX_DEV_PATH	"/dev/" AGENTTX_DEV_NAME
@@ -154,7 +160,9 @@ enum tx_reason {
 	TX_REASON_VERIFY_FAIL	= 4,	/* tests failed -- the normal abort       */
 	TX_REASON_DEADLINE	= 5,	/* a compensable window expired           */
 	TX_REASON_ESCALATE_DENY	= 6,	/* human gate said no, or timed out       */
-	TX_REASON_PROC_DEATH	= 7	/* the agent died mid-transaction (P1-08) */
+	TX_REASON_PROC_DEATH	= 7,	/* the agent died mid-transaction (P1-08) */
+	TX_REASON_DEADLOCK	= 8,	/* chosen as a deadlock victim (P1-17)   */
+	TX_REASON_MAX		= 9
 };
 
 struct tx_stat_arg {
@@ -190,6 +198,73 @@ struct tx_supervisor_arg {
 #define TX_IOC_STAT		_IOWR(AGENTTX_IOC_MAGIC, 0x04, struct tx_stat_arg)
 #define TX_IOC_SUPERVISOR	_IOW (AGENTTX_IOC_MAGIC, 0x05, struct tx_supervisor_arg)
 #define TX_IOC_ABI		_IOR (AGENTTX_IOC_MAGIC, 0x06, __u32)
+
+/* ------------------------------------------------------------------ */
+/* Layer 2a-bis: the wait-for graph  (P1-15 .. P1-18)                  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Why the kernel needs this at all.
+ *
+ * Data conflicts between transactions do NOT deadlock: we use optimistic
+ * concurrency control, so transactions never wait for data -- they proceed
+ * on private overlays and one of them aborts at commit.  What CAN deadlock
+ * is a transaction that blocks on something only another transaction can
+ * give it, and the mechanism creates exactly such a wait: P3-10 escalates an
+ * irrevocable effect to a human approval, and in a multi-agent pipeline the
+ * approver may itself be an agent inside a transaction.
+ *
+ * The kernel is the only place that can see the whole graph, because the
+ * waits cross process boundaries and no single agent knows about the others.
+ *
+ * THE EDGE KINDS ARE NOT COSMETIC.  Recovery differs by kind: a DATA or
+ * OUTPUT waiter can be aborted where it stands, but an ESCALATE waiter is
+ * asleep inside an LSM hook and is not running any code that could notice.
+ * Breaking that edge means denying the approval, which is a different action
+ * with a different authority.
+ */
+enum tx_wait_kind {
+	TX_WAIT_DATA		= 0,	/* commit would conflict with a write set */
+	TX_WAIT_ESCALATE	= 1,	/* asleep awaiting an approval only B gives */
+	TX_WAIT_OUTPUT		= 2,	/* needs a result B has not committed yet */
+	TX_WAIT_MAX		= 3
+};
+
+struct tx_wait_edge {
+	__u32	abi;		/* in:  AGENTTX_ABI_VERSION                  */
+	__u32	kind;		/* in:  enum tx_wait_kind                    */
+	tx_id_t	waiter;		/* in:  blocked transaction (0 = caller's)   */
+	tx_id_t	holder;		/* in:  what it is blocked on                */
+	__u64	since_ns;	/* out: when the edge was registered         */
+	__u32	cycle_len;	/* out: 0 if no cycle, else its length       */
+	__u32	victim_pid;	/* out: 0, or the pid whose tx was aborted   */
+	tx_id_t	victim_tx;	/* out: 0, or the transaction aborted        */
+	__u32	unresolvable;	/* out: 1 = every member DOOMED, see below    */
+	__u32	_pad;
+};
+
+/*
+ * TX_IOC_WAIT registers an edge AND runs detection before returning, so a
+ * caller learns immediately whether it just closed a cycle.  Detection on a
+ * timer would leave a deadlock undiscovered for up to one period, and the
+ * whole point is that the kernel notices at the moment the cycle forms.
+ *
+ * `unresolvable` is the case worth naming: a transaction that emitted an
+ * irrevocable effect is DOOMED, and DOOMED -> ABORTING does not exist in the
+ * state machine above.  So a DOOMED transaction cannot be a deadlock victim,
+ * and a cycle whose members are ALL doomed cannot be broken by the mechanism
+ * that breaks every other cycle.  The kernel reports it rather than hanging.
+ */
+#define TX_IOC_WAIT		_IOWR(AGENTTX_IOC_MAGIC, 0x07, struct tx_wait_edge)
+#define TX_IOC_UNWAIT		_IOW (AGENTTX_IOC_MAGIC, 0x08, struct tx_wait_edge)
+
+#define TX_WAIT_NAMES	{ "data", "escalate", "output" }
+
+/* Bound on the graph.  One node per live transaction; an agent host runs
+ * tens, not thousands.  Detection runs on every edge insert, so the cost of
+ * this bound is paid on a path that must stay cheap. */
+#define TX_WAITFOR_MAX_EDGES	512u
+#define TX_WAITFOR_MAX_NODES	128u
 
 /* ------------------------------------------------------------------ */
 /* Layer 2b: the effect WAL record (P3-07)                             */
@@ -434,6 +509,17 @@ enum tx_state tx_current_state(void);
 
 /* Raise the transaction's worst-class watermark; may move it to DOOMED. */
 int  tx_note_class(tx_id_t tx_id, enum tx_class klass);
+
+/* --- P1 provides: the wait-for graph (P1-15..P1-18) ------------------ */
+/*
+ * Register that @waiter cannot progress until @holder finishes, and run
+ * cycle detection.  Returns 0 if no cycle, 1 if one was found and broken,
+ * and -EDEADLK if one was found and could NOT be broken because every
+ * member is DOOMED.  P3-10's escalation path calls this before sleeping.
+ */
+int  tx_wait_add(tx_id_t waiter, tx_id_t holder, enum tx_wait_kind kind);
+int  tx_wait_del(tx_id_t waiter, tx_id_t holder);
+void tx_wait_drop_all(tx_id_t tx_id);	/* a transaction ended */
 
 /*
  * The fail-closed rule, in exactly one place.  Every consumer of a

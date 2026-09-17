@@ -744,7 +744,25 @@ static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
 	 */
 	snprintf(path, sizeof(path), "%s/decide", dir);
 	for (i = 0; i < 60 * 60 * 20; i++) {	/* up to ~1h at 50ms */
-		FILE *f = fopen(path, "r");
+		FILE *f;
+
+		/*
+		 * If the session directory is gone, nobody can ever decide.
+		 *
+		 * Waiting the full hour in that state strands this process
+		 * holding /dev/agenttx open, which pins the module: `rmmod`
+		 * then fails with "Module agenttx is in use" and the reason is
+		 * three directories away. Abort instead -- fail closed, which
+		 * is also what an undecided transaction should do.
+		 */
+		if (access(dir, F_OK) != 0) {
+			fprintf(stderr,
+				"txctl: session directory %s vanished; aborting\n",
+				dir);
+			break;
+		}
+
+		f = fopen(path, "r");
 
 		if (f) {
 			if (fgets(buf, sizeof(buf), f)) {
@@ -788,6 +806,63 @@ static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
 	return commit ? 0 : 1;
 }
 
+/*
+ * `txctl wait` --- register a wait-for edge and find out immediately whether
+ * it closed a cycle.
+ *
+ * The kernel runs detection inside the ioctl, so the answer comes back with
+ * the call rather than from a log somewhere. A caller about to block on this
+ * wait can therefore refuse to block.
+ */
+static int cmd_wait(int fd, tx_id_t waiter, tx_id_t holder, const char *kind,
+		    int add)
+{
+	struct tx_wait_edge a;
+	unsigned int k = TX_WAIT_OUTPUT;
+
+	if (kind) {
+		if (!strcmp(kind, "data"))          k = TX_WAIT_DATA;
+		else if (!strcmp(kind, "escalate")) k = TX_WAIT_ESCALATE;
+		else if (!strcmp(kind, "output"))   k = TX_WAIT_OUTPUT;
+		else {
+			fprintf(stderr, "txctl: kind must be data|escalate|output\n");
+			return 2;
+		}
+	}
+	if (holder == TX_ID_NONE) {
+		fprintf(stderr, "txctl: --holder is required\n");
+		return 2;
+	}
+
+	memset(&a, 0, sizeof(a));
+	a.abi = AGENTTX_ABI_VERSION;
+	a.kind = k;
+	a.waiter = waiter;
+	a.holder = holder;
+
+	if (ioctl(fd, add ? TX_IOC_WAIT : TX_IOC_UNWAIT, &a) < 0) {
+		if (errno == EDEADLK) {
+			printf("DEADLOCK: this wait closes a cycle that CANNOT be broken.\n");
+			printf("  Every transaction in it is DOOMED -- each emitted an\n");
+			printf("  irrevocable effect, and abort is the only preemption\n");
+			printf("  this mechanism has. See dmesg for the cycle.\n");
+			return 3;
+		}
+		fprintf(stderr, "txctl: TX_IOC_%s: %s\n",
+			add ? "WAIT" : "UNWAIT", strerror(errno));
+		return 1;
+	}
+	if (add && a.cycle_len)
+		printf("deadlock detected and broken; see dmesg for the victim\n");
+	else if (add)
+		printf("wait registered: tx=%llu -> tx=%llu (%s)\n",
+		       (unsigned long long)a.waiter,
+		       (unsigned long long)a.holder, kind ? kind : "output");
+	else
+		printf("wait removed\n");
+	return 0;
+}
+
 static void usage(void)
 {
 	fputs(
@@ -798,6 +873,10 @@ static void usage(void)
 "  stat   [--tx ID] [--json]           report state\n"
 "  commit [--tx ID] [--reason N]       supervisor only\n"
 "  abort  [--tx ID] [--reason N]\n"
+"  wait   [--tx ID] --holder ID [--kind data|escalate|output]\n"
+"                                      register a wait-for edge; detects\n"
+"                                      cycles immediately\n"
+"  unwait [--tx ID] --holder ID        remove one\n"
 "  session --lower DIR [--as USER] -- CMD [ARGS]\n"
 "                                      run, then HOLD for a human decision;\n"
 "                                      --as drops the AGENT to an\n"
@@ -814,7 +893,8 @@ int main(int argc, char **argv)
 	const char *lower = NULL;
 	const char *as_user = NULL;
 	__u32 timeout_ms = 0, reason = TX_REASON_UNSPEC;
-	tx_id_t tx = TX_ID_NONE;
+	tx_id_t tx = TX_ID_NONE, holder = TX_ID_NONE;
+	const char *kind = NULL;
 	int as_json = 0, i, fd, rc;
 	const char *cmd;
 
@@ -837,6 +917,10 @@ int main(int argc, char **argv)
 			lower = argv[++i];
 		else if (!strcmp(argv[i], "--as") && i + 1 < argc)
 			as_user = argv[++i];
+		else if (!strcmp(argv[i], "--holder") && i + 1 < argc)
+			holder = (tx_id_t)strtoull(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--kind") && i + 1 < argc)
+			kind = argv[++i];
 		else if (!strcmp(argv[i], "--json"))
 			as_json = 1;
 		else if (!strcmp(argv[i], "--"))
@@ -865,6 +949,10 @@ int main(int argc, char **argv)
 		rc = do_end(fd, 1, tx, reason, 0) < 0 ? 1 : 0;
 	} else if (!strcmp(cmd, "abort")) {
 		rc = do_end(fd, 0, tx, reason, 0) < 0 ? 1 : 0;
+	} else if (!strcmp(cmd, "wait")) {
+		rc = cmd_wait(fd, tx, holder, kind, 1);
+	} else if (!strcmp(cmd, "unwait")) {
+		rc = cmd_wait(fd, tx, holder, kind, 0);
 	} else if (!strcmp(cmd, "session")) {
 		if (i >= argc || strcmp(argv[i], "--")) {
 			fprintf(stderr, "txctl session: need -- CMD\n");

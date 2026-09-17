@@ -232,7 +232,7 @@ static long tx_ioctl_end(void __user *uarg, bool commit)
 		return -EFAULT;
 	if (arg.abi != AGENTTX_ABI_VERSION)
 		return -EPROTO;
-	if (arg.reason >= TX_REASON_PROC_DEATH + 1)
+	if (arg.reason >= TX_REASON_MAX)
 		return -EINVAL;
 
 	/* TX_ID_NONE means "the transaction I am inside", which for a
@@ -353,6 +353,72 @@ static long tx_ioctl_supervisor(void __user *uarg)
 	return 0;
 }
 
+/*
+ * TX_IOC_WAIT registers an edge and runs detection before returning, so the
+ * caller learns immediately whether it just closed a cycle. That is the
+ * point: a detector on a timer leaves a deadlock undiscovered for up to one
+ * period, and the claim is that the kernel notices when the cycle forms.
+ */
+static long tx_ioctl_wait(void __user *uarg, bool add)
+{
+	struct tx_wait_edge arg;
+	struct tx_ctx *self = NULL;
+	tx_id_t waiter;
+	int ret;
+
+	if (copy_from_user(&arg, uarg, sizeof(arg)))
+		return -EFAULT;
+	if (arg.abi != AGENTTX_ABI_VERSION)
+		return -EPROTO;
+	if (arg.kind >= TX_WAIT_MAX)
+		return -EINVAL;
+
+	waiter = arg.waiter;
+	if (waiter == TX_ID_NONE) {
+		/* "the transaction I am inside", resolved by inheritance. */
+		self = tx_ctx_get_inherited();
+		if (!self)
+			return -ENOENT;
+		waiter = self->tx_id;
+	}
+
+	if (!add) {
+		ret = tx_wait_del(waiter, arg.holder);
+		tx_ctx_put(self);
+		return ret;
+	}
+
+	arg.waiter = waiter;
+	arg.since_ns = 0;
+	arg.cycle_len = 0;
+	arg.victim_tx = TX_ID_NONE;
+	arg.victim_pid = 0;
+	arg.unresolvable = 0;
+	arg._pad = 0;
+
+	ret = tx_wait_add(waiter, arg.holder, (enum tx_wait_kind)arg.kind);
+	tx_ctx_put(self);
+
+	if (ret == -EDEADLK) {
+		arg.unresolvable = 1;
+		arg.cycle_len = 1;		/* a cycle exists; length is in dmesg */
+	} else if (ret == 1) {
+		arg.cycle_len = 1;		/* detected and broken */
+	} else if (ret < 0) {
+		return ret;
+	}
+
+	if (copy_to_user(uarg, &arg, sizeof(arg)))
+		return -EFAULT;
+
+	/*
+	 * -EDEADLK reaches userspace deliberately. A caller about to sleep on
+	 * this wait must be told that sleeping would hang, and it is the only
+	 * answer that is both true and actionable.
+	 */
+	return ret == -EDEADLK ? -EDEADLK : 0;
+}
+
 long tx_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	void __user *uarg = (void __user *)arg;
@@ -366,6 +432,8 @@ long tx_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 	case TX_IOC_ABORT:	return tx_ioctl_end(uarg, false);
 	case TX_IOC_STAT:	return tx_ioctl_stat(uarg);
 	case TX_IOC_SUPERVISOR:	return tx_ioctl_supervisor(uarg);
+	case TX_IOC_WAIT:	return tx_ioctl_wait(uarg, true);
+	case TX_IOC_UNWAIT:	return tx_ioctl_wait(uarg, false);
 	case TX_IOC_ABI: {
 		u32 v = AGENTTX_ABI_VERSION;
 

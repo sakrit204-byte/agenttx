@@ -108,6 +108,12 @@ static int __init agenttx_init(void)
 		return ret;
 	}
 
+	ret = tx_waitfor_init();
+	if (ret) {
+		pr_err("wait-for graph init failed: %d\n", ret);
+		goto err_ctx;
+	}
+
 	ret = misc_register(&agenttx_misc);
 	if (ret) {
 		pr_err("misc_register failed: %d\n", ret);
@@ -150,6 +156,7 @@ static int __init agenttx_init(void)
 err_misc:
 	misc_deregister(&agenttx_misc);
 	misc_registered = false;
+	tx_waitfor_exit();
 err_ctx:
 	tx_ctx_exit();
 	return ret;
@@ -177,6 +184,12 @@ static void __exit agenttx_exit(void)
 		exit_hook_installed = false;
 	}
 
+	/*
+	 * Before the table: the graph's deferred aborts resolve transactions,
+	 * so draining it first means tx_ctx_exit() sees a settled table rather
+	 * than one being mutated underneath it.
+	 */
+	tx_waitfor_exit();
 	tx_ctx_exit();
 	pr_info("unloaded\n");
 }

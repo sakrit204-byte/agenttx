@@ -168,4 +168,11 @@ extern atomic64_t tx_next_id;
 /* kfunc.c (P1-10) */
 int  tx_kfunc_register(void);
 
+/* ---------------------------------------------------------------- */
+/* waitfor.c  (P1-15 .. P1-18)                                       */
+/* ---------------------------------------------------------------- */
+int  tx_waitfor_init(void);
+void tx_waitfor_exit(void);
+unsigned int tx_wait_count(void);
+
 #endif /* _AGENTTX_CORE_H */
