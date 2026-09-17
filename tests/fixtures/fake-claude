@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""
+tests/fixtures/fake-claude --- a scripted Claude Code, for testing the loop.
+
+Emits the same --output-format stream-json event shapes the real binary
+does, so tests/p4/t09_agentloop.sh can assert that a multi-step agent turn
+renders correctly WITHOUT the sandbox agent being signed in and without
+spending anything. It also actually performs its writes, so the transaction
+underneath has real changes to show.
+
+It deliberately includes a tool_use that edits a file and one that runs a
+command, because those are the two the review surface has to explain in
+plain words afterwards.
+"""
+import json, os, sys, time, uuid
+
+
+def ev(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()      # the app streams this; buffering hides the loop
+
+
+def main():
+    args = sys.argv[1:]
+    prompt = ""
+    sid = str(uuid.uuid4())
+    resumed = False
+    i = 0
+    while i < len(args):
+        if args[i] == "-p" and i + 1 < len(args):
+            prompt = args[i + 1]; i += 2; continue
+        if args[i] == "--session-id" and i + 1 < len(args):
+            sid = args[i + 1]; i += 2; continue
+        if args[i] == "--resume" and i + 1 < len(args):
+            sid = args[i + 1]; resumed = True; i += 2; continue
+        i += 1
+
+    ev({"type": "system", "subtype": "init", "session_id": sid,
+        "tools": ["Bash", "Edit", "Write", "Read"], "model": "fake"})
+
+    ev({"type": "assistant", "session_id": sid, "message": {"role": "assistant",
+        "content": [{"type": "text", "text":
+                     ("Continuing. " if resumed else "")
+                     + "I'll do this in two steps: write the file, then check it."}]}})
+
+    ev({"type": "assistant", "session_id": sid, "message": {"role": "assistant",
+        "content": [{"type": "tool_use", "id": "t1", "name": "Write",
+                     "input": {"file_path": "NOTES.md",
+                               "content": "# Notes\n\n" + prompt + "\n"}}]}})
+    with open("NOTES.md", "w") as f:
+        f.write("# Notes\n\n" + prompt + "\n")
+    ev({"type": "user", "session_id": sid, "message": {"role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "t1",
+                     "content": "File created successfully at NOTES.md"}]}})
+
+    ev({"type": "assistant", "session_id": sid, "message": {"role": "assistant",
+        "content": [{"type": "tool_use", "id": "t2", "name": "Bash",
+                     "input": {"command": "wc -l NOTES.md",
+                               "description": "Count the lines"}}]}})
+    n = sum(1 for _ in open("NOTES.md"))
+    ev({"type": "user", "session_id": sid, "message": {"role": "user",
+        "content": [{"type": "tool_result", "tool_use_id": "t2",
+                     "content": "%d NOTES.md" % n}]}})
+
+    ev({"type": "assistant", "session_id": sid, "message": {"role": "assistant",
+        "content": [{"type": "text",
+                     "text": "Done. NOTES.md has %d lines." % n}]}})
+
+    ev({"type": "result", "subtype": "success", "session_id": sid,
+        "result": "Done. NOTES.md has %d lines." % n,
+        "num_turns": 2, "duration_ms": 120, "total_cost_usd": 0.0,
+        "is_error": False})
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -63,3 +63,54 @@ QTabBar::tab { background: #10161f; color: #8b9aad; padding: 8px 16px;
                border: 1px solid #222c3a; border-bottom: none;
                border-top-left-radius: 7px; border-top-right-radius: 7px; margin-right: 3px; }
 QTabBar::tab:selected { background: #161d27; color: #e6edf3; }
+
+/* ---------------------------------------------------------- the chat
+ *
+ * A conversation, styled like one: the person's turns and the agent's
+ * turns are visually different objects, and the tool calls between them
+ * are quieter than both. The agent's reasoning is the thing being read;
+ * the mechanics of each call are there when wanted and out of the way
+ * when not.
+ */
+#ChatHead { background: #10161f; border-bottom: 1px solid #222c3a; }
+#ChatScroll { background: #0b0f16; }
+
+#YouMsg {
+  background: #16202e; border: 1px solid #24344a;
+  border-left: 3px solid #58a6ff; border-radius: 10px;
+}
+#AgentMsg {
+  background: #121820; border: 1px solid #222c3a;
+  border-left: 3px solid #a371f7; border-radius: 10px;
+}
+#ErrMsg {
+  background: #1d1416; border: 1px solid #45252a;
+  border-left: 3px solid #f85149; border-radius: 10px;
+}
+#Who { color: #6b7a8d; font-size: 9.5px; font-weight: 700; letter-spacing: 1px; }
+
+/* Tool calls: collapsed, low contrast, never competing with the prose. */
+#Tool { background: #0e141c; border: 1px solid #1c2531; border-radius: 9px; }
+#ToolName { color: #9fb0c3; font-size: 12px; }
+#ToolBody { background: #070a0f; border: 1px solid #161d27; }
+#Twisty {
+  background: transparent; border: none; color: #6b7a8d;
+  font-size: 12px; padding: 0;
+}
+#Twisty:hover { color: #e6edf3; }
+
+#Divider { border-top: 1px solid #1c2531; }
+
+#Review {
+  background: #121820; border: 1px solid #2a3a22;
+  border-left: 3px solid #3fb950; border-radius: 10px;
+}
+
+#DecideBar { background: #10161f; border-top: 1px solid #222c3a; }
+#Composer  { background: #10161f; border-top: 1px solid #222c3a; }
+#ChatInput {
+  background: #0a0e14; border: 1px solid #222c3a; border-radius: 9px;
+  color: #e6edf3; font-family: -apple-system, "Segoe UI", sans-serif;
+  font-size: 13px; padding: 9px 11px;
+}
+#ChatInput:focus { border: 1px solid #58a6ff; }

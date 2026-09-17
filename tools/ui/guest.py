@@ -251,7 +251,8 @@ set -u
 R=%s
 mkdir -p /usr/local/lib/agenttx
 changed=0
-for f in tools/harness/txctl src/bpf/txload; do
+for f in tools/harness/txctl src/bpf/txload tools/harness/tx-agent.py \
+         tools/harness/tx-shell.sh; do
   src="$R/$f"; dst="/usr/local/bin/$(basename $f)"
   [ -f "$src" ] || continue
   if ! cmp -s "$src" "$dst" 2>/dev/null; then
@@ -447,3 +448,227 @@ echo "---END---"
             return 127, "", "sshpass not installed on the host"
         except subprocess.TimeoutExpired:
             return 124, "", "guest did not answer in time"
+
+
+# ======================================================================
+# Agent threads
+# ======================================================================
+#
+# A THREAD is a conversation; a TRANSACTION is one turn's sandbox. They are
+# deliberately not the same object.
+#
+# The first version of this app made them the same: one task, one
+# transaction, one shell command, decide, done. That is a demo, not a
+# harness. Real work is a conversation -- "add a README", then "actually
+# make it shorter", then "now mention the licence" -- and each of those
+# steps needs its own commit-or-discard decision while the agent keeps the
+# context of everything before it.
+#
+# So a thread holds the Claude Code session id and the full transcript, and
+# each turn opens a fresh transaction around a fresh `claude --resume`.
+# Discarding turn 3 does not unwind the conversation; it unwinds turn 3's
+# writes. That is the behaviour a person actually wants when they look at a
+# diff and say "no, not like that" -- keep talking, drop the edit.
+#
+# Thread state lives in /var/lib/agenttx/threads/, which is NOT inside any
+# protected lower directory. See the header of tools/harness/tx-agent.py:
+# Discard must throw away the work, never the account of the work.
+
+# NOT under /var/lib/agenttx.
+#
+# That directory is the transaction root and it is mode 0700 root-owned on
+# purpose: it holds every transaction's upper layer, so the sandboxed user
+# must not be able to walk it and read what some other transaction wrote.
+# The first version put threads inside it and the agent could not even
+# traverse to its own transcript. The fix is emphatically NOT to relax the
+# tx root -- that trades a broken feature for a sandbox escape. Threads get
+# their own root, world-traversable, with each thread directory owned by
+# the agent that writes it.
+THREADS_DIR = "/var/lib/agenttx-threads"
+
+
+class AgentThreads:
+    """Thread lifecycle, on top of a GuestLink."""
+
+    def __init__(self, link: "GuestLink"):
+        self.g = link
+
+    # --- listing ------------------------------------------------------
+    LIST_SH = r"""
+set -u
+for d in %s/*; do
+  [ -d "$d" ] || continue
+  echo "---THREAD ${d##*/}---"
+  printf 'title='; head -c 300 "$d/title" 2>/dev/null | tr -d '\n'; echo
+  printf 'lower='; head -c 300 "$d/lower" 2>/dev/null | tr -d '\n'; echo
+  printf 'sid=';   head -c 80  "$d/session" 2>/dev/null | tr -d '\n'; echo
+  printf 'turns='; cat "$d/turns" 2>/dev/null || echo 0
+  printf 'created='; cat "$d/created" 2>/dev/null || echo 0
+  printf 'lines='; wc -l < "$d/events.jsonl" 2>/dev/null || echo 0
+  # The transaction for the most recent turn, if it is still open.
+  printf 'tx='; cat "$d/tx" 2>/dev/null || echo ""
+  echo
+done
+echo "---END---"
+"""
+
+    def list(self) -> list[dict]:
+        if not self.g.alive():
+            return []
+        _rc, so, _e = self.g._run_stdin(self.LIST_SH % THREADS_DIR)
+        out: list[dict] = []
+        cur: dict | None = None
+        for line in so.splitlines():
+            if line.startswith("---THREAD "):
+                cur = {"id": line[len("---THREAD "):].rstrip("-")}
+                out.append(cur)
+                continue
+            if line.startswith("---END"):
+                break
+            if cur is not None and "=" in line:
+                k, _, v = line.partition("=")
+                cur[k] = v.strip()
+        for t in out:
+            for k in ("turns", "lines", "created"):
+                try:
+                    t[k] = int(t.get(k) or 0)
+                except ValueError:
+                    t[k] = 0
+        out.sort(key=lambda t: -t.get("created", 0))
+        return out
+
+    # --- reading a transcript ----------------------------------------
+    def events(self, thread_id: str, since: int = 0) -> tuple[list[dict], int]:
+        """
+        Return (new events, new line count) for `thread_id`.
+
+        Incremental by line number rather than re-sending the whole
+        transcript every poll. A long agent turn is a few hundred events and
+        the app polls about once a second; re-reading all of it would put
+        the transcript size into the poll cost, which is the kind of thing
+        that works beautifully in a demo and falls over on the day it
+        matters.
+        """
+        if not self.g.alive():
+            return [], since
+        path = "%s/%s/events.jsonl" % (THREADS_DIR, shlex.quote(thread_id))
+        rc, so, _e = self.g.run(
+            "tail -n +%d %s 2>/dev/null" % (int(since) + 1, path), timeout=20)
+        if rc != 0:
+            return [], since
+        evs, n = [], since
+        for line in so.splitlines():
+            n += 1
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evs.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return evs, n
+
+    # --- starting a turn ----------------------------------------------
+    START_SH = r"""
+set -u
+TD=%(td)s
+mkdir -p "$TD" /run/agenttx
+chmod 0755 "$(dirname "$TD")" 2>/dev/null || true
+LOWER=%(lower)s
+mkdir -p "$LOWER"
+chown %(user)s "$LOWER" 2>/dev/null || true
+
+# First turn sets up the thread; later turns only bump the counter.
+if [ ! -f "$TD/created" ]; then
+  date +%%s > "$TD/created"
+  printf '%%s' %(title)s > "$TD/title"
+  printf '%%s' "$LOWER" > "$TD/lower"
+  printf '%%s' %(sid)s  > "$TD/session"
+  echo 0 > "$TD/turns"
+  : > "$TD/events.jsonl"
+fi
+TURN=$(( $(cat "$TD/turns" 2>/dev/null || echo 0) + 1 ))
+echo "$TURN" > "$TD/turns"
+cat > "$TD/turn-$TURN.prompt" <<'TXPROMPT_EOF'
+%(prompt)s
+TXPROMPT_EOF
+SID=$(cat "$TD/session")
+
+# The agent must be able to write its own transcript.
+chown -R %(user)s "$TD" 2>/dev/null || true
+
+cd "$LOWER"
+setsid /usr/local/bin/txctl session --lower "$LOWER" --as %(user)s -- \
+    /usr/local/bin/tx-agent.py "$TD" "$TURN" "$SID" \
+    > /run/agenttx/last-start.log 2>&1 &
+sleep 2
+# Record which transaction this turn got, so the UI can put the review
+# surface next to the right message instead of guessing from the newest.
+TX=$(sed -n 's/^tx=\([0-9]*\) session started.*/\1/p' /run/agenttx/last-start.log | tail -1)
+printf '%%s' "$TX" > "$TD/tx"
+echo "turn=$TURN"
+echo "tx=$TX"
+cat /run/agenttx/last-start.log
+"""
+
+    def start_turn(self, thread_id: str, lower: str, prompt: str,
+                   title: str, session_uuid: str,
+                   as_user: str = "agent") -> tuple[int, str, str]:
+        self.g.deploy()
+        script = self.START_SH % {
+            "td": shlex.quote("%s/%s" % (THREADS_DIR, thread_id)),
+            "lower": shlex.quote(lower),
+            "user": shlex.quote(as_user),
+            "title": shlex.quote(title),
+            "sid": shlex.quote(session_uuid),
+            "prompt": prompt,
+        }
+        return self.g._run_stdin(script)
+
+    # --- a plain shell turn, no model, no cost ------------------------
+    SHELL_SH = r"""
+set -u
+TD=%(td)s
+mkdir -p "$TD" /run/agenttx
+chmod 0755 "$(dirname "$TD")" 2>/dev/null || true
+LOWER=%(lower)s
+mkdir -p "$LOWER"
+chown %(user)s "$LOWER" 2>/dev/null || true
+if [ ! -f "$TD/created" ]; then
+  date +%%s > "$TD/created"
+  printf '%%s' %(title)s > "$TD/title"
+  printf '%%s' "$LOWER" > "$TD/lower"
+  printf '%%s' %(sid)s  > "$TD/session"
+  echo 0 > "$TD/turns"
+  : > "$TD/events.jsonl"
+fi
+TURN=$(( $(cat "$TD/turns" 2>/dev/null || echo 0) + 1 ))
+echo "$TURN" > "$TD/turns"
+cat > "$TD/turn-$TURN.cmd" <<'TXCMD_EOF'
+%(cmd)s
+TXCMD_EOF
+chown -R %(user)s "$TD" 2>/dev/null || true
+cd "$LOWER"
+setsid /usr/local/bin/txctl session --lower "$LOWER" --as %(user)s -- \
+    /usr/local/bin/tx-shell.sh "$TD" "$TURN" \
+    > /run/agenttx/last-start.log 2>&1 &
+sleep 2
+TX=$(sed -n 's/^tx=\([0-9]*\) session started.*/\1/p' /run/agenttx/last-start.log | tail -1)
+printf '%%s' "$TX" > "$TD/tx"
+echo "turn=$TURN"
+echo "tx=$TX"
+cat /run/agenttx/last-start.log
+"""
+
+    def start_shell(self, thread_id: str, lower: str, cmd: str, title: str,
+                    as_user: str = "agent") -> tuple[int, str, str]:
+        self.g.deploy()
+        script = self.SHELL_SH % {
+            "td": shlex.quote("%s/%s" % (THREADS_DIR, thread_id)),
+            "lower": shlex.quote(lower),
+            "user": shlex.quote(as_user),
+            "title": shlex.quote(title),
+            "sid": shlex.quote("-"),
+            "cmd": cmd,
+        }
+        return self.g._run_stdin(script)

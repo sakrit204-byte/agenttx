@@ -111,6 +111,9 @@ run_test 1 tests/p1/t11_waitfor.sh
 run_test 1 tests/p2/t02_abort.sh
 run_test 1 tests/p2/t03_commit.sh
 run_test 1 tests/p2/t04_watchdog.sh
+# Tier 1, not tier 0: the agent harness needs a real transaction underneath.
+# It uses tests/fixtures/fake-claude, so it needs no login and spends nothing.
+run_test 1 tests/p4/t09_agentloop.sh
 
 # --- tier 2: BPF LSM attached ------------------------------------------
 echo

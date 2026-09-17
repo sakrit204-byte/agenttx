@@ -26,8 +26,11 @@ Owner: P4 (tooling).
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
+import uuid
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -43,9 +46,10 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout,  # noqa: E402
                              QScrollArea, QSizePolicy, QSplitter,
                              QStackedWidget, QTabWidget, QVBoxLayout, QWidget)
 
-from guest import GuestLink  # noqa: E402
+from guest import AgentThreads, GuestLink  # noqa: E402
 
 GUEST = GuestLink()
+THREADS = AgentThreads(GUEST)
 
 C = {
     "created": "#3fb950", "modified": "#d29922", "deleted": "#f85149",
@@ -157,7 +161,7 @@ class Poller(QThread):
     freezes the window on a slow link, and a sandbox console that hangs while
     you are deciding whether to keep an agent's work is worse than no console.
     """
-    sessions = pyqtSignal(list, bool, str)
+    tick = pyqtSignal(list, list, bool, str)    # threads, sessions, alive, err
 
     def __init__(self):
         super().__init__()
@@ -167,11 +171,14 @@ class Poller(QThread):
         while self._run:
             try:
                 alive = GUEST.alive()
-                self.sessions.emit(GUEST.sessions() if alive else [],
-                                   alive, GUEST.last_error or "")
+                self.tick.emit(THREADS.list() if alive else [],
+                               GUEST.sessions() if alive else [],
+                               alive, GUEST.last_error or "")
             except Exception as e:                      # never kill the thread
-                self.sessions.emit([], False, str(e))
-            for _ in range(25):                         # ~2.5s, interruptible
+                self.tick.emit([], [], False, str(e))
+            # A conversation streams, so this is the frame rate of the whole
+            # app. 2.5s made an agent look hung mid-turn.
+            for _ in range(10):                         # ~1s, interruptible
                 if not self._run:
                     return
                 self.msleep(100)
@@ -303,123 +310,6 @@ class FileCard(QFrame):
 
 
 # ---------------------------------------------------------------- review view
-class ReviewView(QWidget):
-    """What the agent did, and the one decision at the end."""
-
-    decided = pyqtSignal(str, str)          # tx, commit|abort
-
-    def __init__(self):
-        super().__init__()
-        self.tx = None
-        self.status = None
-        root = QVBoxLayout(self)
-        root.setContentsMargins(22, 18, 22, 18)
-        root.setSpacing(14)
-
-        self.headline = lab("Nothing selected", "Headline", wrap=True)
-        self.sub = lab("", "Sub", wrap=True)
-        root.addWidget(self.headline)
-        root.addWidget(self.sub)
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.inner = QWidget()
-        self.iv = QVBoxLayout(self.inner)
-        self.iv.setContentsMargins(0, 0, 8, 0)
-        self.iv.setSpacing(11)
-        self.iv.addStretch(1)
-        self.scroll.setWidget(self.inner)
-        root.addWidget(self.scroll, 1)
-
-        self.bar = QFrame()
-        self.bar.setObjectName("Card")
-        bl = QHBoxLayout(self.bar)
-        bl.setContentsMargins(15, 12, 15, 12)
-        self.barnote = lab("", "Warn", wrap=True)
-        bl.addWidget(self.barnote, 1)
-        self.keep = QPushButton("Keep the changes")
-        self.keep.setObjectName("Commit")
-        self.drop = QPushButton("Discard everything")
-        self.drop.setObjectName("Discard")
-        self.keep.clicked.connect(lambda: self._decide("commit"))
-        self.drop.clicked.connect(lambda: self._decide("abort"))
-        bl.addWidget(self.drop)
-        bl.addWidget(self.keep)
-        root.addWidget(self.bar)
-        self.bar.hide()
-
-    def _decide(self, what):
-        if self.tx:
-            self.keep.setEnabled(False)
-            self.drop.setEnabled(False)
-            self.barnote.setText("applying your decision…")
-            self.decided.emit(self.tx, what)
-
-    def clear_rows(self):
-        while self.iv.count() > 1:
-            it = self.iv.takeAt(0)
-            if it.widget():
-                it.widget().deleteLater()
-
-    def show_session(self, s, diff, output):
-        self.tx = s.get("tx")
-        self.status = s.get("status")
-        self.clear_rows()
-
-        head, tail = plain_summary(diff)
-        colour, word = STATUS.get(self.status, ("#8b9aad", self.status or "?"))
-
-        if self.status == "running":
-            self.headline.setText("The agent is working on it…")
-            self.sub.setText(
-                "It is deciding what to run and running it, with no "
-                "permission prompts — it cannot do any harm yet, because "
-                "everything it writes is going into a sandbox layer. "
-                "You decide once, when it is done.")
-        elif self.status == "awaiting-decision":
-            self.headline.setText(head)
-            self.sub.setText(tail)
-        elif self.status == "committed":
-            self.headline.setText("Kept.")
-            self.sub.setText(
-                f"{head} These changes are now written for real into "
-                f"{s.get('lower','the folder')}.")
-        elif self.status == "aborted":
-            self.headline.setText("Discarded.")
-            self.sub.setText(
-                f"{head} None of it happened. {s.get('lower','The folder')} is "
-                "byte-for-byte what it was before the agent ran.")
-        else:
-            self.headline.setText(f"Session {self.tx}: {word}")
-            self.sub.setText(head)
-
-        for d in diff:
-            self.iv.insertWidget(self.iv.count() - 1, FileCard(d))
-
-        if output.strip():
-            o = card()
-            ov = QVBoxLayout(o)
-            ov.setContentsMargins(13, 11, 13, 11)
-            ov.addWidget(lab("What the agent did — its own commands and output",
-                             bold=True))
-            t = QPlainTextEdit()
-            t.setReadOnly(True)
-            t.setPlainText(output[-6000:])
-            t.setMaximumHeight(230)
-            ov.addWidget(t)
-            self.iv.insertWidget(self.iv.count() - 1, o)
-
-        if self.status == "awaiting-decision":
-            self.bar.show()
-            self.keep.setEnabled(True)
-            self.drop.setEnabled(True)
-            self.barnote.setText(
-                "Nothing above has happened yet. This is the only decision "
-                "you have to make.")
-        else:
-            self.bar.hide()
-
-
 # ---------------------------------------------------------------- under the hood
 class HoodView(QWidget):
     """
@@ -567,14 +457,409 @@ class HoodView(QWidget):
 
 
 # ---------------------------------------------------------------- main window
+# ---------------------------------------------------------------- the chat
+#
+# A thread is a conversation and the app renders it as one. This is the part
+# that was missing: clicking a task used to show a diff and a blob of raw
+# output, which tells you WHAT changed but never HOW the agent got there --
+# what it decided to try, what came back, what it did about it. That is the
+# thing you actually need when the answer is wrong, and it is what every
+# other harness shows you.
+#
+# The events come from tools/harness/tx-agent.py, which is Claude Code's own
+# --output-format stream-json, so what is drawn here is the real loop and not
+# a summary of it.
+
+
+class ToolCard(QFrame):
+    """One tool call, with its result folded underneath."""
+
+    # Tool calls are the bulk of an agent turn and most of them are boring --
+    # a read, a grep, a file that went where it was supposed to. Showing all
+    # of them expanded turns the conversation into a wall of JSON and buries
+    # the two lines of reasoning that matter. Collapsed by default, one click
+    # to open, and a failure opens itself.
+
+    def __init__(self, name: str, detail: str):
+        super().__init__()
+        self.setObjectName("Tool")
+        v = QVBoxLayout(self)
+        v.setContentsMargins(12, 9, 12, 9)
+        v.setSpacing(6)
+
+        head = QHBoxLayout()
+        head.setSpacing(8)
+        self.toggle = QPushButton("▸")
+        self.toggle.setObjectName("Twisty")
+        self.toggle.setFixedWidth(20)
+        self.toggle.setCheckable(True)
+        self.toggle.toggled.connect(self._toggled)
+        head.addWidget(self.toggle)
+        head.addWidget(lab(name, "ToolName", bold=True))
+        self.detail = lab(detail, "Muted")
+        self.detail.setWordWrap(False)
+        head.addWidget(self.detail, 1)
+        self.state = pill("running", C["def"])
+        head.addWidget(self.state)
+        v.addLayout(head)
+
+        self.body = QPlainTextEdit()
+        self.body.setReadOnly(True)
+        self.body.setObjectName("ToolBody")
+        self.body.setMaximumHeight(220)
+        self.body.hide()
+        v.addWidget(self.body)
+        self._text = ""
+
+    def _toggled(self, on):
+        self.toggle.setText("▾" if on else "▸")
+        self.body.setVisible(on and bool(self._text))
+
+    def set_input(self, text: str):
+        self._text = text
+        self.body.setPlainText(text)
+
+    def set_result(self, text: str, is_error: bool):
+        self._text = (self._text + "\n\n--- result ---\n" + text).strip()
+        self.body.setPlainText(self._text[-8000:])
+        self.state.setText("failed" if is_error else "done")
+        colour = C["deleted"] if is_error else C["created"]
+        self.state.setStyleSheet(
+            f"background:{colour}22;color:{colour};border:1px solid {colour}66;")
+        if is_error:
+            # A failure is never the boring case.
+            self.toggle.setChecked(True)
+
+
+class Bubble(QFrame):
+    """One message. `who` is 'you', 'agent', or 'problem'."""
+
+    def __init__(self, who: str, text: str):
+        super().__init__()
+        self.setObjectName({"you": "YouMsg", "agent": "AgentMsg"}.get(
+            who, "ErrMsg"))
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 11, 14, 11)
+        v.setSpacing(5)
+        tag = {"you": "YOU", "agent": "AGENT", "problem": "PROBLEM"}[who]
+        v.addWidget(lab(tag, "Who"))
+        self.body = lab(text, wrap=True)
+        # Selectable: people copy an agent's explanation into commit
+        # messages and bug reports constantly.
+        self.body.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse)
+        v.addWidget(self.body)
+
+    def append(self, text: str):
+        self.body.setText(self.body.text() + text)
+
+
+class TurnDivider(QFrame):
+    """Marks where one turn ends and its transaction is waiting."""
+
+    def __init__(self, turn: int, tx: str):
+        super().__init__()
+        self.setObjectName("Divider")
+        h = QHBoxLayout(self)
+        h.setContentsMargins(2, 4, 2, 4)
+        h.setSpacing(8)
+        h.addWidget(lab(f"turn {turn}", "Muted"))
+        if tx:
+            h.addWidget(lab(f"· transaction {tx}", "Muted"))
+        h.addStretch(1)
+
+
+class ChatView(QWidget):
+    decided = pyqtSignal(str, str)          # tx, commit|abort
+    submitted = pyqtSignal(str)             # follow-up text
+
+    def __init__(self):
+        super().__init__()
+        self.thread_id = None
+        self._review = None                 # the change-report block, if any
+        self._review_sig = None
+        self._tools = {}                    # tool_use_id -> ToolCard
+        self._last_bubble = None
+        self._seen_turns = set()
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        head = QFrame()
+        head.setObjectName("ChatHead")
+        hv = QVBoxLayout(head)
+        hv.setContentsMargins(20, 13, 20, 13)
+        hv.setSpacing(2)
+        self.title = lab("No task open", "Headline")
+        self.where = lab("", "Muted")
+        hv.addWidget(self.title)
+        hv.addWidget(self.where)
+        root.addWidget(head)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setObjectName("ChatScroll")
+        self.inner = QWidget()
+        self.col = QVBoxLayout(self.inner)
+        self.col.setContentsMargins(20, 16, 20, 16)
+        self.col.setSpacing(10)
+        self.col.addStretch(1)
+        self.scroll.setWidget(self.inner)
+        root.addWidget(self.scroll, 1)
+
+        # --- the decision, when there is one --------------------------
+        self.bar = QFrame()
+        self.bar.setObjectName("DecideBar")
+        bl = QHBoxLayout(self.bar)
+        bl.setContentsMargins(18, 12, 18, 12)
+        bl.setSpacing(10)
+        self.barnote = lab("", "Warn", wrap=True)
+        bl.addWidget(self.barnote, 1)
+        self.drop = QPushButton("Discard")
+        self.drop.setObjectName("Discard")
+        self.keep = QPushButton("Keep the changes")
+        self.keep.setObjectName("Commit")
+        self.drop.clicked.connect(lambda: self._decide("abort"))
+        self.keep.clicked.connect(lambda: self._decide("commit"))
+        bl.addWidget(self.drop)
+        bl.addWidget(self.keep)
+        root.addWidget(self.bar)
+        self.bar.hide()
+        self.tx = None
+
+        # --- composer -------------------------------------------------
+        comp = QFrame()
+        comp.setObjectName("Composer")
+        cv = QHBoxLayout(comp)
+        cv.setContentsMargins(16, 12, 16, 14)
+        cv.setSpacing(10)
+        self.input = QPlainTextEdit()
+        self.input.setObjectName("ChatInput")
+        self.input.setPlaceholderText(
+            "Reply to the agent…    ($ runs a shell command instead)")
+        self.input.setFixedHeight(64)
+        self.input.installEventFilter(self)
+        self.send = QPushButton("Send")
+        self.send.setObjectName("Dispatch")
+        self.send.clicked.connect(self._submit)
+        cv.addWidget(self.input, 1)
+        cv.addWidget(self.send)
+        root.addWidget(comp)
+
+    # Enter sends, Shift+Enter makes a newline. This is what every chat
+    # client does and fingers already know it; a Send-button-only composer
+    # is a small papercut repeated all day.
+    def eventFilter(self, obj, ev):
+        if obj is self.input and ev.type() == ev.Type.KeyPress:
+            if ev.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and \
+               not (ev.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+                self._submit()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _submit(self):
+        text = self.input.toPlainText().strip()
+        if text:
+            self.input.clear()
+            self.submitted.emit(text)
+
+    def _decide(self, what):
+        if self.tx:
+            self.keep.setEnabled(False)
+            self.drop.setEnabled(False)
+            self.barnote.setText("applying your decision…")
+            self.decided.emit(self.tx, what)
+
+    # --- rendering ----------------------------------------------------
+    def add(self, w):
+        self.col.insertWidget(self.col.count() - 1, w)
+
+    def reset(self, thread):
+        self.thread_id = thread.get("id") if thread else None
+        self._review = None
+        self._review_sig = None
+        self._tools.clear()
+        self._last_bubble = None
+        self._seen_turns.clear()
+        while self.col.count() > 1:
+            it = self.col.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        if thread:
+            self.title.setText(thread.get("title") or "Task")
+            self.where.setText(
+                f"agent may only change {thread.get('lower','?')}  ·  "
+                f"{thread.get('turns',0)} turn"
+                f"{'s' if thread.get('turns',0) != 1 else ''}")
+        else:
+            self.title.setText("No task open")
+            self.where.setText("")
+
+    def at_bottom(self) -> bool:
+        b = self.scroll.verticalScrollBar()
+        return b.value() >= b.maximum() - 80
+
+    def scroll_end(self):
+        b = self.scroll.verticalScrollBar()
+        b.setValue(b.maximum())
+
+    def append_events(self, evs):
+        """Render new transcript events. Incremental: never rebuilds."""
+        stick = self.at_bottom()
+        for e in evs:
+            try:
+                self._one(e)
+            except Exception as ex:           # a bad event must not blank the UI
+                print(f"agenttx: cannot render {e.get('type')}: {ex}",
+                      file=sys.stderr)
+        if stick:
+            QTimer.singleShot(0, self.scroll_end)
+
+    def _one(self, e):
+        kind = e.get("type")
+        turn = e.get("turn")
+
+        if kind == "tx_turn_start":
+            if turn not in self._seen_turns:
+                self._seen_turns.add(turn)
+                if len(self._seen_turns) > 1:
+                    self.add(TurnDivider(turn, e.get("tx") or ""))
+            prompt = (e.get("prompt") or "").strip()
+            if e.get("shell"):
+                prompt = "$ " + prompt
+            self.add(Bubble("you", prompt))
+            self._last_bubble = None
+            return
+
+        if kind == "assistant":
+            for c in (e.get("message", {}) or {}).get("content", []) or []:
+                if c.get("type") == "text":
+                    txt = (c.get("text") or "").strip()
+                    if txt:
+                        self.add(Bubble("agent", txt))
+                        self._last_bubble = None
+                elif c.get("type") == "tool_use":
+                    card_ = ToolCard(c.get("name") or "tool",
+                                     self._summarise(c.get("name"),
+                                                     c.get("input") or {}))
+                    card_.set_input(json.dumps(c.get("input") or {},
+                                               indent=2)[:8000])
+                    self._tools[c.get("id")] = card_
+                    self.add(card_)
+            return
+
+        if kind == "user":
+            for c in (e.get("message", {}) or {}).get("content", []) or []:
+                if c.get("type") != "tool_result":
+                    continue
+                card_ = self._tools.get(c.get("tool_use_id"))
+                body = c.get("content")
+                if isinstance(body, list):
+                    body = "\n".join(
+                        b.get("text", "") for b in body if isinstance(b, dict))
+                if card_:
+                    card_.set_result(str(body or "")[:8000],
+                                     bool(c.get("is_error")))
+            return
+
+        if kind == "tx_output":
+            txt = (e.get("text") or "").strip()
+            if txt:
+                card_ = ToolCard("shell", "the command you typed")
+                card_.set_result(txt, False)
+                card_.toggle.setChecked(True)
+                self.add(card_)
+            return
+
+        if kind in ("tx_error", "tx_notice"):
+            self.add(Bubble("problem", (e.get("text") or "").strip()))
+            return
+
+        if kind == "result":
+            n = e.get("num_turns")
+            ms = e.get("duration_ms")
+            bits = []
+            if n is not None:
+                bits.append(f"{n} step{'s' if n != 1 else ''}")
+            if ms:
+                bits.append(f"{ms/1000:.1f}s")
+            if bits:
+                self.add(lab("finished — " + ", ".join(bits), "Muted"))
+            return
+
+    @staticmethod
+    def _summarise(name, inp):
+        """One line saying what this call is about, in the caller's terms."""
+        if not isinstance(inp, dict):
+            return ""
+        for key in ("file_path", "path", "pattern", "command", "url"):
+            if inp.get(key):
+                return str(inp[key])[:120]
+        if inp.get("description"):
+            return str(inp["description"])[:120]
+        return ""
+
+    def set_review(self, tx, status, diff):
+        """
+        Put the change report at the end of the conversation.
+
+        Not on a separate screen. The question "do I keep this?" is asked
+        about what the agent just said it did, and the honest answer usually
+        depends on both halves -- the explanation and the actual diff. Making
+        someone switch views to compare them is how a review becomes a
+        rubber stamp.
+        """
+        self.tx = tx
+        if status != "awaiting-decision" or not diff:
+            self.bar.hide()
+            if self._review is not None and status in ("committed", "aborted"):
+                self._review.setEnabled(False)
+            return
+
+        sig = (tx, json.dumps(diff, sort_keys=True))
+        if sig != self._review_sig:
+            self._review_sig = sig
+            if self._review is not None:
+                self._review.deleteLater()
+            self._review = self._build_review(diff)
+            self.add(self._review)
+            QTimer.singleShot(0, self.scroll_end)
+
+        head, _tail = plain_summary(diff)
+        self.bar.show()
+        self.keep.setEnabled(True)
+        self.drop.setEnabled(True)
+        self.barnote.setText(
+            head + "  Nothing has touched the real folder yet.")
+
+    def _build_review(self, diff):
+        box = QFrame()
+        box.setObjectName("Review")
+        v = QVBoxLayout(box)
+        v.setContentsMargins(15, 13, 15, 13)
+        v.setSpacing(9)
+        head, tail = plain_summary(diff)
+        v.addWidget(lab("What this turn would change", bold=True))
+        v.addWidget(lab(head + " " + tail, "Sub", wrap=True))
+        for d in diff:
+            v.addWidget(FileCard(d))
+        return box
+
+
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AgentTx")
-        self.resize(1280, 840)
+        self.resize(1320, 860)
+        self.threads = []
         self.sessions = []
-        self.selected = None
+        self.selected = None            # thread id
+        self._since = {}                # thread id -> transcript lines read
+        self._rendered = None           # thread id currently drawn
+        self._fetching = set()          # thread ids with a fetch in flight
         self._last_sig = None
+        self._busy = False
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -610,29 +895,29 @@ class Main(QMainWindow):
         row.setSpacing(9)
         self.dirin = QLineEdit("/tmp/work")
         self.dirin.setObjectName("DirInput")
-        self.dirin.setMaximumWidth(230)
+        self.dirin.setMaximumWidth(220)
         self.dirin.setToolTip(
             "The only folder the agent is allowed to change.\n"
             "Everything it writes here goes into a sandbox layer first.")
         self.taskin = QLineEdit()
         self.taskin.setObjectName("TaskInput")
         self.taskin.setPlaceholderText(
-            "What should the agent do?   e.g. add a README explaining this folder")
-        self.taskin.returnPressed.connect(self.dispatch)
-        self.go = QPushButton("Give it the task")
+            "Start a new task…   e.g. add a README explaining this folder")
+        self.taskin.returnPressed.connect(self.new_task)
+        self.go = QPushButton("Start task")
         self.go.setObjectName("Dispatch")
-        self.go.clicked.connect(self.dispatch)
+        self.go.clicked.connect(self.new_task)
         row.addWidget(self.dirin)
         row.addWidget(self.taskin, 1)
         row.addWidget(self.go)
         hv.addLayout(row)
         hv.addWidget(lab(
-            "You describe the task; <b>the agent decides what commands to "
-            "run</b>. It runs with no permission prompts, because it cannot "
-            "do any harm until you press Keep — every file it touches lands "
-            "in a sandbox layer first. "
+            "You describe the task; <b>the agent decides what to run and "
+            "keeps going until it is done</b> — no permission prompts, "
+            "because nothing it writes is real until you press Keep. "
+            "Every step it takes is on the right. "
             "<span style='color:#4b5666'>(A leading <b>$</b> runs one shell "
-            "command directly instead, using no model.)</span>",
+            "command instead, using no model and costing nothing.)</span>",
             "Muted", wrap=True))
         rv.addWidget(hdr)
 
@@ -651,10 +936,11 @@ class Main(QMainWindow):
         side.setMaximumWidth(340)
 
         self.stack = QStackedWidget()
-        self.review = ReviewView()
-        self.review.decided.connect(self.decide)
+        self.chat = ChatView()
+        self.chat.decided.connect(self.decide)
+        self.chat.submitted.connect(self.follow_up)
         self.hoodview = HoodView()
-        self.stack.addWidget(self.review)
+        self.stack.addWidget(self.chat)
         self.stack.addWidget(self.hoodview)
 
         split.addWidget(side)
@@ -663,7 +949,7 @@ class Main(QMainWindow):
         rv.addWidget(split, 1)
 
         self.poll = Poller()
-        self.poll.sessions.connect(self.on_sessions)
+        self.poll.tick.connect(self.on_tick)
         self.poll.start()
 
         self.hoodtimer = QTimer(self)
@@ -679,46 +965,56 @@ class Main(QMainWindow):
                 print(f"agenttx: callback failed: {e}", file=sys.stderr)
 
     # ------------------------------------------------------------ actions
-    def dispatch(self):
+    #
+    # A task is a CONVERSATION, not a command. `new_task` opens one;
+    # `follow_up` continues the one already open, carrying everything the
+    # agent learned in the earlier turns. Each turn still gets its own
+    # transaction, so "keep turn 1, throw away turn 2" is a thing you can
+    # actually do.
+    def new_task(self):
         task = self.taskin.text().strip()
         d = self.dirin.text().strip()
-        if not task or not d:
+        if not task or not d or self._busy:
             return
+        tid = "t%d-%s" % (int(time.time()), uuid.uuid4().hex[:6])
+        title = task[:70] + ("…" if len(task) > 70 else "")
+        self.taskin.clear()
+        self.selected = tid
+        self._since[tid] = 0
+        self._rendered = None
+        self._start(tid, d, task, title)
+
+    def follow_up(self, text):
+        t = self._thread(self.selected)
+        if not t or self._busy:
+            return
+        self._start(t["id"], t.get("lower") or self.dirin.text().strip(),
+                    text, t.get("title") or "Task", sid=t.get("sid"))
+
+    def _start(self, tid, lower, text, title, sid=None):
+        self._busy = True
         self.go.setEnabled(False)
         self.go.setText("starting…")
+        self.chat.send.setEnabled(False)
 
-        # WHAT GETS RUN, and why it costs nothing by default.
-        #
-        # Whatever is typed is run as a shell command. A plain command --
-        # a build, a script, a refactor -- uses no API and costs nothing, and
-        # the sandbox is entirely useful that way.
-        #
-        # Prefixing with "ai:" runs Claude Code instead, and THAT bills the
-        # account the guest is authenticated with. It is opt-in, per task, and
-        # visible in the session list afterwards, so nobody spends money by
-        # clicking a button whose label did not say so.
-        if task.lower().startswith("ai:"):
-            prompt = task[3:].strip().replace("'", "'\\''")
-            # --dangerously-skip-permissions is the POINT here, not a shortcut.
-            # The flag is named for a world without this sandbox, where skipping
-            # approval lets an agent do anything to your machine. Inside a
-            # transaction every write lands in a copy-on-write layer and nothing
-            # is real until a human presses Keep. Asking per action would be
-            # asking twice.
-            # </dev/null: without it Claude Code waits 3s for piped stdin
-            # and prints a warning into the session output. The agent has no
-            # stdin here -- its instructions are the prompt.
-            cmd = ("claude --dangerously-skip-permissions -p '" + prompt
-                   + "' < /dev/null")
-        else:
-            cmd = "sh -c '" + task.replace("'", "'\\''") + "'"
+        # A leading "$" is the no-model path: run exactly this command, bill
+        # nothing, and still get the transaction and the transcript. It is
+        # also the control arm -- see tools/harness/tx-shell.sh.
+        shell = text.startswith("$")
+        payload = text[1:].strip() if shell else text
 
-        def done(res):
+        def done(_res):
+            self._busy = False
             self.go.setEnabled(True)
-            self.go.setText("Run agent")
-            self.taskin.clear()
+            self.go.setText("Start task")
+            self.chat.send.setEnabled(True)
 
-        run_async(self, GUEST.session_start, d, cmd, then=done)
+        if shell:
+            run_async(self, THREADS.start_shell, tid, lower, payload, title,
+                      then=done)
+        else:
+            run_async(self, THREADS.start_turn, tid, lower, payload, title,
+                      sid or str(uuid.uuid4()), then=done)
 
     def decide(self, tx, what):
         run_async(self, GUEST.session_decide, tx, what)
@@ -735,7 +1031,10 @@ class Main(QMainWindow):
                   self.hoodview.update_live(s) if isinstance(s, dict) else None)
 
     # ------------------------------------------------------------ polling
-    def on_sessions(self, sessions, alive, err):
+    def _thread(self, tid):
+        return next((t for t in self.threads if t.get("id") == tid), None)
+
+    def on_tick(self, threads, sessions, alive, err):
         if alive:
             self.linkpill.setStyleSheet(
                 "background:#3fb95022;color:#3fb950;border:1px solid #3fb95066;")
@@ -745,81 +1044,110 @@ class Main(QMainWindow):
                 "background:#f8514922;color:#f85149;border:1px solid #f8514966;")
             self.linkpill.setText("sandbox offline")
 
-        self.sessions = sorted(sessions, key=lambda s: -int(s.get("tx") or 0))
-        sig = [(s.get("tx"), s.get("status"), s.get("changed")) for s in self.sessions]
+        self.threads = threads
+        self.sessions = sessions
+        sig = [(t.get("id"), t.get("turns"), t.get("lines"), t.get("tx"))
+               for t in threads]
         if sig != self._last_sig:
             self._last_sig = sig
             self.rebuild_list()
-        if self.selected:
-            self.load_selected()
+        self.refresh_chat()
+
+    def refresh_chat(self):
+        t = self._thread(self.selected)
+        if not t:
+            return
+        if self._rendered != t["id"]:
+            # Switched threads: redraw from the top of the transcript. This
+            # is the bug the whole rewrite started from -- clicking a task
+            # used to change the diff and leave the conversation behind.
+            self._rendered = t["id"]
+            self._since[t["id"]] = 0
+            self._fetching.discard(t["id"])
+            self.chat.reset(t)
+
+        # ONE transcript fetch in flight at a time.
+        #
+        # The fetch is an ssh round trip and the poll is 1 Hz, so on a slow
+        # link a second poll fires before the first returns. `since` has not
+        # been advanced yet, so the second request asks for the same lines
+        # and the conversation renders every message twice. Seen exactly
+        # that way: a freshly opened thread showed its prompt and its tool
+        # call duplicated, and only settled once the requests stopped
+        # overlapping.
+        tid = t["id"]
+        since = self._since.get(tid, 0)
+        if t.get("lines", 0) > since and tid not in self._fetching:
+            self._fetching.add(tid)
+
+            def got(res, tid=tid):
+                self._fetching.discard(tid)
+                if isinstance(res, Exception) or not isinstance(res, tuple):
+                    return
+                evs, n = res
+                # Another thread may have been selected while this was in
+                # flight; those events belong to a conversation that is no
+                # longer on screen.
+                if self._rendered != tid:
+                    return
+                self._since[tid] = n
+                self.chat.append_events(evs)
+            run_async(self, THREADS.events, tid, since, then=got)
+
+        # The decision belongs to the newest turn's transaction.
+        tx = t.get("tx")
+        s = next((x for x in self.sessions if x.get("tx") == tx), None)
+        if not s:
+            self.chat.set_review(tx, None, [])
+            return
+        if s.get("status") != "awaiting-decision":
+            self.chat.set_review(tx, s.get("status"), [])
+            return
+
+        def gotdiff(diff):
+            if isinstance(diff, Exception):
+                return
+            self.chat.set_review(tx, "awaiting-decision", diff)
+        run_async(self, GUEST.session_diff, tx, then=gotdiff)
 
     def rebuild_list(self):
         keep = self.selected
         self.list.blockSignals(True)
         self.list.clear()
-        for s in self.sessions:
-            colour, word = STATUS.get(s.get("status"), ("#8b9aad", s.get("status") or "?"))
+        for t in self.threads:
+            tx = t.get("tx")
+            s = next((x for x in self.sessions if x.get("tx") == tx), None)
+            status = (s or {}).get("status") or "—"
+            colour, word = STATUS.get(status, ("#8b9aad", status))
             w = QWidget()
             wl = QVBoxLayout(w)
             wl.setContentsMargins(11, 9, 11, 9)
             wl.setSpacing(3)
             top = QHBoxLayout()
-            top.addWidget(lab(f"Task {s.get('tx')}", bold=True))
+            top.addWidget(lab(t.get("title") or "Task", bold=True))
             top.addStretch(1)
-            p = pill(word, colour)
-            top.addWidget(p)
+            top.addWidget(pill(word, colour))
             wl.addLayout(top)
-            n = int(s.get("changed") or 0)
-            wl.addWidget(lab(
-                f"{n} file{'s' if n != 1 else ''} changed" if n else "no changes",
-                "Muted"))
-            wl.addWidget(lab(s.get("lower") or "", "Muted"))
+            n = t.get("turns", 0)
+            wl.addWidget(lab(f"{n} turn{'s' if n != 1 else ''}", "Muted"))
+            wl.addWidget(lab(t.get("lower") or "", "Muted"))
             it = QListWidgetItem()
             it.setSizeHint(QSize(0, w.sizeHint().height()))
             self.list.addItem(it)
             self.list.setItemWidget(it, w)
         self.list.blockSignals(False)
 
-        if keep:
-            for i, s in enumerate(self.sessions):
-                if s.get("tx") == keep:
-                    self.list.setCurrentRow(i)
-                    return
-        if not self.sessions:
-            return
-        # Open on something worth looking at. Sessions are newest-first, but
-        # the newest may have changed nothing -- landing on "The agent changed
-        # nothing" when a session below it is waiting on a real decision is a
-        # bad first frame. Prefer: awaiting a decision AND has changes.
-        for want in (lambda s: s.get("status") == "awaiting-decision"
-                               and int(s.get("changed") or 0) > 0,
-                     lambda s: int(s.get("changed") or 0) > 0,
-                     lambda s: True):
-            for i, s in enumerate(self.sessions):
-                if want(s):
-                    self.list.setCurrentRow(i)
-                    return
+        for i, t in enumerate(self.threads):
+            if t.get("id") == keep:
+                self.list.setCurrentRow(i)
+                return
+        if self.threads:
+            self.list.setCurrentRow(0)
 
     def pick(self, row):
-        if 0 <= row < len(self.sessions):
-            self.selected = self.sessions[row].get("tx")
-            self.load_selected()
-
-    def load_selected(self):
-        s = next((x for x in self.sessions if x.get("tx") == self.selected), None)
-        if not s:
-            return
-
-        def got(res):
-            if isinstance(res, Exception):
-                return
-            diff, out = res
-            self.review.show_session(s, diff, out)
-
-        def fetch(tx):
-            return GUEST.session_diff(tx), GUEST.session_output(tx, 300)
-
-        run_async(self, fetch, self.selected, then=got)
+        if 0 <= row < len(self.threads):
+            self.selected = self.threads[row].get("id")
+            self.refresh_chat()
 
     def closeEvent(self, e):
         """

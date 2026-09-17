@@ -17,6 +17,25 @@ echo "t01_load: module lifecycle (P1-03)"
 [[ -f "$KO" ]] || { echo "  (no $KO -- run: make STUB=1 module)" >&2; exit 77; }
 
 # Start from a known state.
+#
+# If something still HOLDS the module, every cycle below fails on rmmod and
+# the suite goes red naming this test, which is not where the problem is.
+# That happened for real: a `txctl session` left over from the desktop app
+# was waiting on a decision nobody was going to give, pinning the module at
+# refcount 1. Skip with the holder named instead of failing with "Module
+# agenttx is in use" ten times.
+held=$(awk '$1=="agenttx"{print $3}' /proc/modules 2>/dev/null)
+if [[ -n "${held:-}" && "$held" != 0 ]]; then
+	echo "  module is held (refcount $held) by:" >&2
+	for pd in /proc/[0-9]*; do
+		for fd in "$pd"/fd/*; do
+			[[ "$(readlink "$fd" 2>/dev/null)" == /dev/agenttx ]] && \
+				echo "    pid ${pd##*/} $(tr '\0' ' ' < "$pd/cmdline" 2>/dev/null)" >&2
+		done
+	done
+	echo "  not a P1-03 failure; clear the holder and re-run" >&2
+	exit 77
+fi
 rmmod agenttx 2>/dev/null || true
 
 dmesg_start
