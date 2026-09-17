@@ -72,3 +72,4 @@ paper/*.out
 paper/*.toc
 paper/*.synctex.gz
 tools/harness/featcheck
+tools/bench/txbench

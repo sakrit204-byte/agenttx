@@ -204,8 +204,13 @@ pipeline: synth train quantize weights
 # P4's CSV format.  The runner enforces the format; a bench that does not
 # conform is a failure, not a warning.
 # ---------------------------------------------------------------------
+.PHONY: txbench
+txbench: tools/bench/txbench
+tools/bench/txbench: tools/bench/txbench.c include/agenttx.h
+	$(CC) -O2 -Wall -Wextra -Werror -I include -o $@ $<
+
 .PHONY: bench
-bench:
+bench: txbench
 	@mkdir -p $(RESULTS)
 	$(PY) tools/bench/run.py --all --out $(RESULTS)
 
