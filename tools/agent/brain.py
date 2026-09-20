@@ -34,7 +34,19 @@ import urllib.request
 # the host itself that address does not resolve to anything useful, so the
 # env override is what tests and host-side tools use.
 DEFAULT_HOST = os.environ.get("AGENTTX_OLLAMA", "http://10.0.2.2:11434")
-DEFAULT_MODEL = os.environ.get("AGENTTX_MODEL", "qwen2.5-coder:7b")
+# qwen2.5:7b, not qwen2.5-coder:7b.
+#
+# The coder variant writes better Python and has NO tool-calling template
+# in Ollama, so every call arrives as text in the content field. The loop
+# parses that, but after two or three steps the model starts describing
+# the next step instead of taking it -- on the same task, the coder model
+# stopped after writing the script and narrated "2. run: python3
+# add_spdx.py", while this one wrote it, ran it, verified the result with
+# grep and reported the count, in five steps.
+#
+# Tool use is the job here. Being slightly better at prose about code is
+# not worth being unable to finish.
+DEFAULT_MODEL = os.environ.get("AGENTTX_MODEL", "qwen2.5:7b")
 
 
 class BrainError(RuntimeError):

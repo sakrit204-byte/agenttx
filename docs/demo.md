@@ -125,17 +125,45 @@ surprising, running the identical change by hand through the identical
 machinery tells you in one step whether you are looking at the model or
 the sandbox.
 
-## Honest note on model size
+## Model choice matters more than model size
 
-`qwen2.5-coder:7b` has no tool-calling template in Ollama, so every call
-arrives as text in the content field. The loop parses that, but after two
-or three steps the model tends to start *describing* the next step
-instead of taking it. The harness detects the common shapes of this --
-repeated identical calls, repeated failures, empty replies, narration
-instead of action -- and says so rather than reporting a success that
-changed nothing. It cannot make a small model finish a long task.
+Both are 7B. Both run on the same GPU at the same speed. On the same task:
 
-Use a tools-native model (`qwen2.5:7b`, `llama3.1:8b`) for multi-step work
-and keep the coder model for single edits:
+| | `qwen2.5-coder:7b` | `qwen2.5:7b` |
+|---|---|---|
+| tool-calling template in Ollama | none | yes |
+| how calls arrive | as text in `content` | in `tool_calls` |
+| result on this task | wrote the script, then narrated `2. run: python3 add_spdx.py` and stopped | wrote it, ran it, verified with grep, reported 25 files — 5 steps, 12.4s |
 
-    ollama pull qwen2.5:7b
+The coder variant writes better Python. It cannot reliably *use tools*,
+which is the job here, so `qwen2.5:7b` is the default. Override per run
+with `--model`, or set `AGENTTX_MODEL`.
+
+The harness parses text-form calls either way, and detects the failure
+shapes a small model produces — repeated identical calls, repeated
+failures, empty replies, narration instead of action — so it reports
+stalling instead of a success that changed nothing. That is worth having
+regardless of model; it is not a substitute for a model that can finish.
+
+## What a completed run looks like
+
+    TOOL  list_dir    {"path": "src"}
+    TOOL  write_file  {"path": "src/add_spdx.py", ...}
+    TOOL  run         {"command": "python3 src/add_spdx.py"}
+      -> Changed 25 files.
+    TOOL  run         {"command": "grep -rLx ... | wc -l"}
+      -> 0
+    AGENT added the required header to 25 .py files under src/
+
+Then, before deciding — **Try it**, and the same commands in a plain
+guest shell:
+
+    inside the transaction          the real repo
+    ----------------------          -------------
+    0 files missing the header      24 files missing it
+    app.py starts with the SPDX     app.py starts with
+      line                            "from __future__ ..."
+    app.py still parses
+
+Twenty-five files rewritten, verified working, and none of it has
+happened yet.
