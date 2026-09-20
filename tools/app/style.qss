@@ -114,3 +114,16 @@ QTabBar::tab:selected { background: #161d27; color: #e6edf3; }
   font-size: 13px; padding: 9px 11px;
 }
 #ChatInput:focus { border: 1px solid #58a6ff; }
+
+/* Swarm: the plan, and the thing the plan can go wrong in. */
+#Plan {
+  background: #121820; border: 1px solid #243449;
+  border-left: 3px solid #58a6ff; border-radius: 10px;
+}
+#Conflict {
+  background: #1d1a14; border: 1px solid #4a3a1f;
+  border-left: 3px solid #d29922; border-radius: 10px;
+}
+#LiveStrip { background: #0d131b; border-top: 1px solid #1c2531; }
+#LiveVal { color: #9fb0c3; font-size: 11px;
+           font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace; }

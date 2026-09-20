@@ -143,6 +143,17 @@ grep -q bpf /sys/kernel/security/lsm 2>/dev/null && echo "lsm yes" || echo "lsm 
 pgrep -x txload >/dev/null 2>&1 && echo "running yes" || echo "running no"
 echo "---HEALTH---"
 dmesg 2>/dev/null | grep -cE 'BUG:|KASAN|WARNING:|circular locking' || echo 0
+echo "---LIVE---"
+# The handful of numbers the always-on strip shows while agents work.
+# Counted here rather than in four separate ssh calls: this script is
+# already one round trip and the strip refreshes about once a second.
+printf 'opentx='; ls -1d /run/agenttx/session-* 2>/dev/null | wc -l
+printf 'upperfiles='; find /var/lib/agenttx -mindepth 3 -path '*/upper/*' -type f 2>/dev/null | wc -l
+printf 'wfg='; dmesg 2>/dev/null | grep -c 'agenttx/wf: edge' || echo 0
+printf 'deadlocks='; dmesg 2>/dev/null | grep -c 'agenttx/wf:.*cycle' || echo 0
+printf 'brain='; curl -s --max-time 2 http://10.0.2.2:11434/api/tags 2>/dev/null \
+  | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1 || true
+echo
 echo "---END---"
 """ % "%s"
 
@@ -232,6 +243,17 @@ echo "---END---"
             out["health"] = int((sec.get("HEALTH") or ["0"])[0])
         except ValueError:
             pass
+        for l in sec.get("LIVE", []):
+            k, _, v = l.partition("=")
+            v = v.strip()
+            if k in ("opentx", "upperfiles", "wfg", "deadlocks"):
+                try:
+                    out[{"opentx": "open_tx", "upperfiles": "upper_files",
+                         "wfg": "wfg_edges", "deadlocks": "deadlocks"}[k]] = int(v or 0)
+                except ValueError:
+                    pass
+            elif k == "brain":
+                out["brain"] = v or "no local model"
         return out
 
     # --- deploy: binaries must run from LOCAL disk, not the 9p share ----
@@ -249,8 +271,19 @@ echo "---END---"
     DEPLOY_SH = r"""
 set -u
 R=%s
-mkdir -p /usr/local/lib/agenttx
+mkdir -p /usr/local/lib/agenttx /usr/local/lib/agenttx/agent
 changed=0
+# The agent package is plain Python, so it can be copied wholesale. It is
+# still copied OUT of the 9p share rather than run from it: executing from
+# 9p faults inside ld-linux for binaries, and keeping one rule for
+# everything is cheaper than remembering which files are exempt.
+for f in "$R"/tools/agent/*.py; do
+  [ -f "$f" ] || continue
+  dst="/usr/local/lib/agenttx/agent/$(basename "$f")"
+  if ! cmp -s "$f" "$dst" 2>/dev/null; then
+    cp -f "$f" "$dst" && chmod 0755 "$dst" && changed=$((changed+1))
+  fi
+done
 for f in tools/harness/txctl src/bpf/txload tools/harness/tx-agent.py \
          tools/harness/tx-shell.sh; do
   src="$R/$f"; dst="/usr/local/bin/$(basename $f)"
@@ -647,9 +680,7 @@ SID=$(cat "$TD/session")
 chown -R "$RUNAS" "$TD" 2>/dev/null || true
 
 cd "$LOWER"
-setsid /usr/local/bin/txctl session --lower "$LOWER" --as "$RUNAS" -- \
-    /usr/local/bin/tx-agent.py "$TD" "$TURN" "$SID" \
-    > /run/agenttx/last-start.log 2>&1 &
+setsid %(runner)s > /run/agenttx/last-start.log 2>&1 &
 sleep 2
 # Record which transaction this turn got, so the UI can put the review
 # surface next to the right message instead of guessing from the newest.
@@ -660,17 +691,54 @@ echo "tx=$TX"
 cat /run/agenttx/last-start.log
 """
 
+    # Which brain runs the turn.
+    #
+    # "local" is the default and the one that matters: a 7B served by
+    # Ollama on the host, reached across QEMU's user network. It costs
+    # nothing, runs offline, and is the configuration the system is meant
+    # to be evaluated in. "claude" stays because it is the useful
+    # reference point -- when the local model does something odd, the
+    # question is always whether the harness is wrong or the model is
+    # small, and being able to run the identical task through a strong
+    # model answers it. "swarm" runs N agents, each in its own
+    # transaction, against the same folder.
+    AGENT_DIR = "/usr/local/lib/agenttx/agent"
+
+    def _runner(self, mode: str, td_q: str, session_uuid: str,
+                lower_q: str, agents: int, model: str | None) -> str:
+        base = ('/usr/local/bin/txctl session --lower "$LOWER" '
+                '--as "$RUNAS" -- ')
+        m = (" --model %s" % shlex.quote(model)) if model else ""
+        if mode == "claude":
+            return base + '/usr/local/bin/tx-agent.py "$TD" "$TURN" %s' % (
+                shlex.quote(session_uuid))
+        if mode == "swarm":
+            # The orchestrator is NOT itself inside a transaction: it
+            # writes no files, it starts the agents that do. Wrapping it in
+            # one would add an empty transaction to every swarm run and
+            # make the agent count in the UI wrong by one.
+            return ('/usr/bin/env python3 %s/swarm.py "$TD" "$TURN" '
+                    '--lower "$LOWER" --agents %d --runas "$RUNAS"%s'
+                    % (self.AGENT_DIR, int(agents), m))
+        return base + '/usr/bin/env python3 %s/loop.py "$TD" "$TURN"%s' % (
+            self.AGENT_DIR, m)
+
     def start_turn(self, thread_id: str, lower: str, prompt: str,
                    title: str, session_uuid: str,
-                   as_user: str = "agent") -> tuple[int, str, str]:
+                   as_user: str = "agent", mode: str = "local",
+                   agents: int = 3, model: str | None = None
+                   ) -> tuple[int, str, str]:
         self.g.deploy()
+        td = "%s/%s" % (THREADS_DIR, thread_id)
         script = self.START_SH % {
-            "td": shlex.quote("%s/%s" % (THREADS_DIR, thread_id)),
+            "td": shlex.quote(td),
             "lower": shlex.quote(lower),
             "user": shlex.quote(as_user),
             "title": shlex.quote(title),
             "sid": shlex.quote(session_uuid),
             "prompt": prompt,
+            "runner": self._runner(mode, shlex.quote(td), session_uuid,
+                                   shlex.quote(lower), agents, model),
         }
         return self.g._run_stdin(script)
 

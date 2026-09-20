@@ -44,7 +44,8 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout,  # noqa: E402
                              QLabel, QLineEdit, QListWidget, QListWidgetItem,
                              QMainWindow, QPlainTextEdit, QPushButton,
                              QScrollArea, QSizePolicy, QSplitter,
-                             QStackedWidget, QTabWidget, QVBoxLayout, QWidget)
+                             QComboBox, QStackedWidget, QTabWidget,
+                             QVBoxLayout, QWidget)
 
 from guest import AgentThreads, GuestLink  # noqa: E402
 
@@ -535,7 +536,7 @@ class ToolCard(QFrame):
 class Bubble(QFrame):
     """One message. `who` is 'you', 'agent', or 'problem'."""
 
-    def __init__(self, who: str, text: str):
+    def __init__(self, who: str, text: str, agent: str = ""):
         super().__init__()
         self.setObjectName({"you": "YouMsg", "agent": "AgentMsg"}.get(
             who, "ErrMsg"))
@@ -543,6 +544,10 @@ class Bubble(QFrame):
         v.setContentsMargins(14, 11, 14, 11)
         v.setSpacing(5)
         tag = {"you": "YOU", "agent": "AGENT", "problem": "PROBLEM"}[who]
+        # With a swarm running, "AGENT" alone is useless -- three of them
+        # are talking and the whole question is which one did what.
+        if agent:
+            tag = agent.upper()
         v.addWidget(lab(tag, "Who"))
         self.body = lab(text, wrap=True)
         # Selectable: people copy an agent's explanation into commit
@@ -628,6 +633,32 @@ class ChatView(QWidget):
         root.addWidget(self.bar)
         self.bar.hide()
         self.tx = None
+
+        # --- live kernel strip ----------------------------------------
+        #
+        # The "Under the hood" panel is a separate screen you have to go
+        # and look at, which means during the one moment it is interesting
+        # -- while agents are actually running -- nobody is looking at it.
+        # This is the always-on version: the few numbers that change while
+        # work happens, on the same screen as the work.
+        self.strip = QFrame()
+        self.strip.setObjectName("LiveStrip")
+        sl = QHBoxLayout(self.strip)
+        sl.setContentsMargins(16, 6, 16, 6)
+        sl.setSpacing(16)
+        self.live = {}
+        for key, label in (("tx", "open transactions"),
+                           ("files", "sandboxed writes"),
+                           ("wfg", "wait-for edges"),
+                           ("dead", "deadlocks broken"),
+                           ("model", "brain")):
+            sl.addWidget(lab(label, "Muted"))
+            w = lab("—", "LiveVal")
+            self.live[key] = w
+            sl.addWidget(w)
+            sl.addSpacing(4)
+        sl.addStretch(1)
+        root.addWidget(self.strip)
 
         # --- composer -------------------------------------------------
         comp = QFrame()
@@ -738,10 +769,12 @@ class ChatView(QWidget):
                 if c.get("type") == "text":
                     txt = (c.get("text") or "").strip()
                     if txt:
-                        self.add(Bubble("agent", txt))
+                        self.add(Bubble("agent", txt, e.get("agent") or ""))
                         self._last_bubble = None
                 elif c.get("type") == "tool_use":
-                    card_ = ToolCard(c.get("name") or "tool",
+                    who = e.get("agent")
+                    card_ = ToolCard((("%s · " % who) if who else "")
+                                     + (c.get("name") or "tool"),
                                      self._summarise(c.get("name"),
                                                      c.get("input") or {}))
                     card_.set_input(json.dumps(c.get("input") or {},
@@ -777,6 +810,65 @@ class ChatView(QWidget):
             self.add(Bubble("problem", (e.get("text") or "").strip()))
             return
 
+        if kind == "swarm_plan":
+            box = QFrame(); box.setObjectName("Plan")
+            v = QVBoxLayout(box); v.setContentsMargins(14, 11, 14, 11)
+            v.setSpacing(6)
+            parts = e.get("parts") or []
+            v.addWidget(lab("Split across %d agents" % len(parts), bold=True))
+            v.addWidget(lab(
+                "Each one gets its own transaction on the same folder, so "
+                "they cannot overwrite each other until you decide.",
+                "Muted", wrap=True))
+            for p in parts:
+                v.addWidget(lab("<b>%s</b> — %s" % (p.get("name", "?"),
+                                                    p.get("task", "")),
+                                wrap=True))
+            self.add(box)
+            return
+
+        if kind == "swarm_agent_start":
+            self.add(lab("▸ %s started" % e.get("agent", "?"), "Muted"))
+            return
+
+        if kind == "swarm_agent_done":
+            self.add(lab("✓ %s finished (transaction %s)"
+                         % (e.get("agent", "?"), e.get("tx") or "?"), "Muted"))
+            return
+
+        if kind == "swarm_result":
+            box = QFrame()
+            conflicts = e.get("conflicts") or []
+            box.setObjectName("Conflict" if conflicts else "Plan")
+            v = QVBoxLayout(box); v.setContentsMargins(14, 11, 14, 11)
+            v.setSpacing(6)
+            agents = e.get("agents") or []
+            if conflicts:
+                v.addWidget(lab("%d conflict%s between agents"
+                                % (len(conflicts),
+                                   "s" if len(conflicts) != 1 else ""),
+                                bold=True))
+                v.addWidget(lab(
+                    "These agents changed the same file in separate "
+                    "transactions. Neither saw the other's version, so if "
+                    "you keep both, whichever you keep second wins and the "
+                    "first one's work is gone.", "Muted", wrap=True))
+                for c in conflicts:
+                    v.addWidget(lab("<b>%s</b> and <b>%s</b> both wrote: %s"
+                                    % (c.get("a"), c.get("b"),
+                                       ", ".join(c.get("paths") or [])),
+                                    wrap=True))
+            else:
+                v.addWidget(lab("%d agents finished, no overlapping files"
+                                % len(agents), bold=True))
+            for ag in agents:
+                v.addWidget(lab("%s (tx %s): %s"
+                                % (ag.get("name"), ag.get("tx") or "?",
+                                   ", ".join(ag.get("files") or []) or "nothing"),
+                                "Muted", wrap=True))
+            self.add(box)
+            return
+
         if kind == "result":
             n = e.get("num_turns")
             ms = e.get("duration_ms")
@@ -800,6 +892,20 @@ class ChatView(QWidget):
         if inp.get("description"):
             return str(inp["description"])[:120]
         return ""
+
+    def update_live(self, snap):
+        """Numbers that move while the agents work."""
+        if not snap.get("reachable"):
+            for w in self.live.values():
+                w.setText("—")
+            self.live["model"].setText("sandbox offline")
+            return
+        st = snap.get("stat") or {}
+        self.live["tx"].setText(str(snap.get("open_tx", "0")))
+        self.live["files"].setText(str(snap.get("upper_files", st.get("n_written", 0))))
+        self.live["wfg"].setText(str(snap.get("wfg_edges", 0)))
+        self.live["dead"].setText(str(snap.get("deadlocks", 0)))
+        self.live["model"].setText(snap.get("brain") or "—")
 
     def set_review(self, tx, status, diff):
         """
@@ -905,11 +1011,25 @@ class Main(QMainWindow):
         self.taskin.setPlaceholderText(
             "Start a new task…   e.g. add a README explaining this folder")
         self.taskin.returnPressed.connect(self.new_task)
+        self.mode = QComboBox()
+        self.mode.setObjectName("Mode")
+        # The label says what it DOES, not what it is called internally.
+        # "swarm" means nothing to somebody looking at this for the first
+        # time; "3 agents at once" is the same thing and explains itself.
+        self.mode.addItem("1 agent", ("local", 1))
+        self.mode.addItem("2 agents at once", ("swarm", 2))
+        self.mode.addItem("3 agents at once", ("swarm", 3))
+        self.mode.addItem("5 agents at once", ("swarm", 5))
+        self.mode.setToolTip(
+            "Each agent gets its OWN transaction on the same folder.\n"
+            "If two of them change the same file, you are told before\n"
+            "you keep anything.")
         self.go = QPushButton("Start task")
         self.go.setObjectName("Dispatch")
         self.go.clicked.connect(self.new_task)
         row.addWidget(self.dirin)
         row.addWidget(self.taskin, 1)
+        row.addWidget(self.mode)
         row.addWidget(self.go)
         hv.addLayout(row)
         hv.addWidget(lab(
@@ -1013,9 +1133,10 @@ class Main(QMainWindow):
         if shell:
             run_async(self, THREADS.start_shell, tid, lower, payload, title,
                       then=done)
-        else:
-            run_async(self, THREADS.start_turn, tid, lower, payload, title,
-                      sid or str(uuid.uuid4()), then=done)
+            return
+        mode, n = self.mode.currentData() or ("local", 1)
+        run_async(self, THREADS.start_turn, tid, lower, payload, title,
+                  sid or str(uuid.uuid4()), "agent", mode, n, then=done)
 
     def decide(self, tx, what):
         run_async(self, GUEST.session_decide, tx, what)
@@ -1047,6 +1168,10 @@ class Main(QMainWindow):
 
         self.threads = threads
         self.sessions = sessions
+        # The strip is live whether or not the hood panel is open, which
+        # is the entire point of it.
+        run_async(self, GUEST.snapshot, then=lambda sn:
+                  self.chat.update_live(sn) if isinstance(sn, dict) else None)
         sig = [(t.get("id"), t.get("turns"), t.get("lines"), t.get("tx"))
                for t in threads]
         if sig != self._last_sig:
