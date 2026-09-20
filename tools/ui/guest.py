@@ -953,17 +953,23 @@ def structure(link: "GuestLink", tx: str) -> dict:
         if sec == "LOWERDIR":
             out["lower"] = line.strip()
         elif sec == "CHANGED":
-            f = line.split(None, 2)
-            if len(f) >= 2:
-                rest = f[2] if len(f) > 2 else "0"
-                path, _, size = rest.rpartition(" ")
-                if not path:
-                    path, size = rest, "0"
-                try:
-                    size = int(size)
-                except ValueError:
-                    path, size = rest, 0
-                out["changed"].append({"kind": f[0], "path": path or f[1],
+            # "kind path size", and the PATH may contain spaces.
+            #
+            # Splitting into three from the left put the first path token
+            # in the middle field, so a path without spaces lost its name
+            # entirely and the tree filled up with entries called "2112"
+            # and "70" -- the file sizes. Take the kind off the front and
+            # the size off the back; whatever is between is the path.
+            kind, _, rest = line.partition(" ")
+            path, _, size = rest.rstrip().rpartition(" ")
+            if not path:
+                path, size = rest.strip(), "0"
+            try:
+                size = int(size)
+            except ValueError:
+                size = 0
+            if path:
+                out["changed"].append({"kind": kind, "path": path,
                                        "bytes": size})
         elif sec == "UNTOUCHED":
             out["untouched"].append(line.strip())
