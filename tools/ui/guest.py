@@ -886,3 +886,87 @@ cat /run/agenttx/last-start.log
             "cmd": cmd,
         }
         return self.g._run_stdin(script)
+
+
+# ======================================================================
+# Project-scale structure
+# ======================================================================
+#
+# The diff walk runs `diff -u` once per changed file. That is fine for the
+# handful an agent usually touches and hopeless for a real repository: a
+# few hundred files is a few hundred processes over one ssh round trip,
+# and it blows the 30s timeout long before it finishes.
+#
+# So structure() is the cheap half. It answers "what is the shape of this
+# change" -- which paths, what kind, how big -- with one find per layer and
+# no diffing at all. The expensive per-file diff stays where it belongs:
+# behind a click on a single file.
+
+STRUCTURE_SH = r"""
+set -u
+TX=%(tx)s
+U=/var/lib/agenttx/tx-$TX/upper
+L=$(readlink /var/lib/agenttx/tx-$TX/lower 2>/dev/null)
+echo "---LOWERDIR---"
+printf '%%s\n' "$L"
+echo "---CHANGED---"
+# kind path size
+find "$U" -mindepth 1 2>/dev/null | sort | head -4000 | while read -r f; do
+  rel=${f#"$U/"}
+  old="$L/$rel"
+  if [ -d "$f" ]; then
+    [ -d "$old" ] && continue          # unchanged directory, not a change
+    echo "dir $rel 0"
+  elif [ -c "$f" ]; then
+    echo "deleted $rel 0"              # overlayfs whiteout
+  elif [ -e "$old" ]; then
+    echo "modified $rel $(stat -c %%s "$f" 2>/dev/null || echo 0)"
+  else
+    echo "created $rel $(stat -c %%s "$f" 2>/dev/null || echo 0)"
+  fi
+done
+echo "---UNTOUCHED---"
+# Everything already in the folder, so the tree can show what was left
+# alone as well as what was not. Capped: past a few thousand entries the
+# tree stops being something a person reads.
+find "$L" -mindepth 1 -type f 2>/dev/null | sort | head -4000 | \
+  sed "s|^$L/||"
+echo "---END---"
+"""
+
+
+def structure(link: "GuestLink", tx: str) -> dict:
+    """Shape of one transaction's change set, without diffing anything."""
+    out = {"lower": "", "changed": [], "untouched": [], "truncated": False}
+    if not link.alive():
+        return out
+    rc, so, _e = link._run_stdin(STRUCTURE_SH % {"tx": shlex.quote(str(tx))})
+    if rc != 0:
+        return out
+    sec = None
+    for line in so.splitlines():
+        if line.startswith("---") and line.endswith("---"):
+            sec = line.strip("-")
+            continue
+        if not line.strip():
+            continue
+        if sec == "LOWERDIR":
+            out["lower"] = line.strip()
+        elif sec == "CHANGED":
+            f = line.split(None, 2)
+            if len(f) >= 2:
+                rest = f[2] if len(f) > 2 else "0"
+                path, _, size = rest.rpartition(" ")
+                if not path:
+                    path, size = rest, "0"
+                try:
+                    size = int(size)
+                except ValueError:
+                    path, size = rest, 0
+                out["changed"].append({"kind": f[0], "path": path or f[1],
+                                       "bytes": size})
+        elif sec == "UNTOUCHED":
+            out["untouched"].append(line.strip())
+    if len(out["untouched"]) >= 4000 or len(out["changed"]) >= 4000:
+        out["truncated"] = True
+    return out

@@ -63,6 +63,9 @@ Rules:
 - Look before you leap: list_dir and read_file before writing or editing.
 - Make the change with write_file or edit_file. Do not just describe it.
 - One tool call at a time. Wait for the result before the next.
+- CHANGING MANY FILES: do not edit them one by one. Write a small script
+  and run it with the `run` tool, then check the result. Editing forty
+  files individually will run out of steps long before it is finished.
 - When the task is genuinely done, reply with a short plain-text summary
   of what you changed and call no more tools.
 
@@ -167,6 +170,34 @@ def extract_call(text: str):
     return None
 
 
+def looks_like_narration(text: str) -> bool:
+    """
+    Is this prose ANNOUNCING the next step rather than reporting the last?
+
+    A small model stops mid-task to write out what it is about to do. One
+    real run ended with exactly "2. run: python3 add_spdx.py" -- the
+    script written, never executed, the turn reported as complete.
+
+    "Has it changed anything yet" is not enough on its own: writing the
+    script IS a change, so that test passed and the turn still ended one
+    step short of the point. These two patterns are narrow on purpose --
+    a numbered step, or a tool name used as a label -- because the cost of
+    a false positive is one wasted call and the cost of a false negative
+    is a task that silently stops half-done.
+    """
+    import re as _re
+
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _re.match(r"^\s*\d+\s*[.)]\s+\S", t):
+        return True
+    if _re.search(r"\b(run|write_file|edit_file|read_file|list_dir)\s*:\s*\S",
+                  t):
+        return True
+    return False
+
+
 def trim(messages: list[dict]) -> list[dict]:
     """
     Keep the conversation inside the model's window.
@@ -237,6 +268,10 @@ def main() -> int:
     steps = 0
     last_call = None
     repeats = 0
+    fail_streak = {}
+    empty = 0
+    nudged = 0
+    did_work = False        # has any tool actually changed something?
     summary = ""
 
     while steps < MAX_STEPS:
@@ -280,8 +315,54 @@ def main() -> int:
         if content:
             t.text(content)
             summary = content
+
+        if not calls and not content:
+            # NOTHING came back: no text, no tool call.
+            #
+            # The first version treated this like any other tool-less
+            # reply and ended the turn -- so an agent that had silently
+            # produced nothing reported success with an empty summary,
+            # which is the worst failure this harness can have. Seen on a
+            # real task: two directory listings, an empty response, and a
+            # cheerful "finished, 2 steps". A blank answer is not an
+            # answer; push once, then say plainly that it stalled.
+            empty += 1
+            if empty <= 2:
+                messages.append({
+                    "role": "user",
+                    "content": ("You returned an empty response. Either "
+                                "call a tool to make progress, or give me "
+                                "your final summary of what you changed.")})
+                continue
+            t.event("tx_notice",
+                    text=("The agent stopped responding — it returned an "
+                          "empty answer three times. Nothing was changed. "
+                          "This usually means the task needs breaking into "
+                          "smaller steps for a model this size."))
+            break
+
         if not calls:
-            break                      # prose with no tool call ends the turn
+            # Prose with no tool call normally means "finished". But a
+            # small model also stops to NARRATE the next step -- one run
+            # ended with the literal text "2. run: python3 add_spdx.py"
+            # after writing the script but never running it, and the turn
+            # was reported as complete having changed nothing.
+            #
+            # The test is semantic, not string matching: if nothing in
+            # this turn has actually changed anything yet, "I am done" is
+            # almost certainly wrong. Nudge once. A genuinely read-only
+            # task just repeats its answer and costs one extra call.
+            if (not did_work or looks_like_narration(content)) and nudged < 2:
+                nudged += 1
+                messages.append({
+                    "role": "user",
+                    "content": ("You have not changed anything yet, so the "
+                                "task is not finished. If you described a "
+                                "next step, take it now by calling the "
+                                "tool. If the task genuinely needs no "
+                                "changes, say so explicitly.")})
+                continue
+            break
 
         messages.append({"role": "assistant", "content": content,
                          "tool_calls": calls})
@@ -296,6 +377,28 @@ def main() -> int:
 
             sig = json.dumps([name, shown], sort_keys=True)
             out, err = T.call(root, name, args)
+
+            # Repeated FAILURE of the same tool, even with different
+            # arguments each time.
+            #
+            # The exact-repeat check below catches a model stuck on one
+            # identical call. It does not catch the commoner shape: five
+            # attempts at the same idea, each slightly reworded, all
+            # failing the same way. Seen for real -- a 7B tried to cram a
+            # for-loop into `python3 -c` five times running, got the same
+            # SyntaxError each time, and never changed approach. Counting
+            # consecutive errors per tool catches that, and the nudge goes
+            # in the observation where the model is actually reading.
+            if err:
+                fail_streak[name] = fail_streak.get(name, 0) + 1
+                if fail_streak[name] >= 3:
+                    out += ("\n\n[That is %d failures in a row from %s. The "
+                            "approach is not working -- change it. If a "
+                            "command keeps failing to parse, write the "
+                            "script to a file with write_file and then run "
+                            "the file.]" % (fail_streak[name], name))
+            else:
+                fail_streak[name] = 0
             if sig == last_call:
                 repeats += 1
                 # Say it in the OBSERVATION, where the model is actually
@@ -316,6 +419,8 @@ def main() -> int:
                 repeats = 0
             last_call = sig
 
+            if not err and name in ("write_file", "edit_file", "run"):
+                did_work = True
             t.tool_result(tid, out, err)
             messages.append({"role": "tool", "content": out})
         steps += 1
@@ -326,7 +431,8 @@ def main() -> int:
                      "changed so far is below and still reviewable."
                      % MAX_STEPS)
 
-    t.event("result", subtype="success", result=summary,
+    t.event("result", subtype="success" if summary else "empty",
+            result=summary,
             num_turns=steps, duration_ms=int((time.time() - started) * 1000),
             is_error=False)
     t.event("tx_turn_end", exit=0)

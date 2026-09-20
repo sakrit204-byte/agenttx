@@ -71,6 +71,16 @@ out, err = T.call(root, "edit_file",
                   {"path": "a.txt", "old": "nope", "new": "x"})
 (ok if err else bad)("an edit whose text is absent is refused")
 
+# A 7B reaches for old:"" when it wants to PREPEND, and str.count("") is
+# len+1, so the first version told it "that text appears 2073 times in a
+# 2072-byte file" -- which is true, useless, and unrecoverable.
+out, err = T.call(root, "edit_file",
+                  {"path": "a.txt", "old": "", "new": "header\n"})
+if err and "must not be empty" in out:
+    ok("an empty search string is refused, and says what to do instead")
+else:
+    bad("empty search string handled badly: %r" % out[:90])
+
 # --- bad arguments must come back as a message, not a crash -----------
 out, err = T.call(root, "read_file", {})
 (ok if err and "path" in out else bad)("a missing argument is reported")

@@ -45,9 +45,10 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout,  # noqa: E402
                              QMainWindow, QPlainTextEdit, QPushButton,
                              QScrollArea, QSizePolicy, QSplitter,
                              QComboBox, QStackedWidget, QTabWidget,
-                             QTextEdit, QVBoxLayout, QWidget)
+                             QTextEdit, QTreeWidget, QTreeWidgetItem,
+                             QVBoxLayout, QWidget)
 
-from guest import AgentThreads, GuestLink  # noqa: E402
+from guest import AgentThreads, GuestLink, structure as STRUCTURE  # noqa: E402
 
 GUEST = GuestLink()
 THREADS = AgentThreads(GUEST)
@@ -629,7 +630,146 @@ class LayerStack(QWidget):
             "actual lines, with additions in green and removals in red.")
 
 
+class FileTree(QWidget):
+    """
+    The folder, as a tree, with this layer's changes marked on it.
+
+    The layer cards answer "how much changed"; at ten files that is the
+    whole story. At four hundred it is not -- what you need then is WHERE
+    the change landed. A flat list of four hundred paths is not an answer
+    either, because the shape of a project is its directories, and "every
+    file under src/api changed and nothing under tests did" is the sort of
+    thing a tree shows in one glance and a list never does.
+
+    Untouched files are drawn too, greyed. A tree containing only changes
+    looks like the whole project changed.
+    """
+
+    file_picked = pyqtSignal(str)
+
+    MARK = {
+        "created":  ("#3fb950", "new"),
+        "modified": ("#d29922", "edited"),
+        "deleted":  ("#f85149", "deleted"),
+        "dir":      ("#58a6ff", "new folder"),
+    }
+
+    def __init__(self):
+        super().__init__()
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(7)
+
+        self.summary = lab("", "Sub", wrap=True)
+        v.addWidget(self.summary)
+
+        self.tree = QTreeWidget()
+        self.tree.setObjectName("Tree")
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["file", "what happened to it"])
+        self.tree.setRootIsDecorated(True)
+        self.tree.setUniformRowHeights(True)      # keeps 4000 rows smooth
+        self.tree.header().setStretchLastSection(True)
+        self.tree.itemClicked.connect(self._picked)
+        v.addWidget(self.tree, 1)
+
+        self.legend = lab(
+            "<span style='color:#3fb950'>■</span> new &nbsp;"
+            "<span style='color:#d29922'>■</span> edited &nbsp;"
+            "<span style='color:#f85149'>■</span> deleted &nbsp;"
+            "<span style='color:#4b5666'>■</span> untouched &nbsp;&nbsp;"
+            "click a changed file for its lines", "Muted", wrap=True)
+        v.addWidget(self.legend)
+        self._sig = None
+
+    def _picked(self, item, _col):
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        if path:
+            self.file_picked.emit(path)
+
+    def load(self, struct):
+        changed = {c["path"]: c for c in struct.get("changed", [])}
+        untouched = [p for p in struct.get("untouched", [])
+                     if p not in changed]
+        sig = (tuple(sorted(changed)), len(untouched))
+        if sig == self._sig:
+            return
+        self._sig = sig
+
+        self.tree.clear()
+        counts = {}
+        for c in changed.values():
+            counts[c["kind"]] = counts.get(c["kind"], 0) + 1
+        n = len(changed)
+        if n:
+            bits = ["%d %s" % (v, self.MARK.get(k, ("", k))[1])
+                    for k, v in sorted(counts.items())]
+            self.summary.setText(
+                "<b>%d file%s changed</b> in this layer — %s. %d other file%s "
+                "in the folder were left alone. None of it is in your folder "
+                "yet." % (n, "s" if n != 1 else "", ", ".join(bits),
+                          len(untouched), "s" if len(untouched) != 1 else ""))
+        else:
+            self.summary.setText("This layer has changed nothing yet.")
+
+        # Build the directory tree once, then hang files off it.
+        nodes = {}
+
+        def node_for(dirpath):
+            if not dirpath:
+                return None
+            if dirpath in nodes:
+                return nodes[dirpath]
+            parent_path, _, name = dirpath.rpartition("/")
+            parent = node_for(parent_path)
+            it = (QTreeWidgetItem(parent) if parent
+                  else QTreeWidgetItem(self.tree))
+            it.setText(0, name + "/")
+            it.setForeground(0, QColor("#9fb0c3"))
+            nodes[dirpath] = it
+            return it
+
+        def add(path, kind):
+            d, _, name = path.rpartition("/")
+            parent = node_for(d)
+            it = (QTreeWidgetItem(parent) if parent
+                  else QTreeWidgetItem(self.tree))
+            it.setText(0, name)
+            if kind:
+                colour, word = self.MARK.get(kind, ("#8b9aad", kind))
+                it.setText(1, word)
+                it.setForeground(0, QColor(colour))
+                it.setForeground(1, QColor(colour))
+                it.setData(0, Qt.ItemDataRole.UserRole, path)
+                f = it.font(0); f.setBold(True); it.setFont(0, f)
+            else:
+                it.setForeground(0, QColor("#4b5666"))
+
+        for path in sorted(changed):
+            add(path, changed[path]["kind"])
+        # Cap the untouched half: it is context, not the subject, and a
+        # project with 30k files should not freeze the panel to show them.
+        for path in untouched[:1500]:
+            add(path, None)
+
+        # Open the directories that actually contain changes, and leave the
+        # rest shut. Expanding everything on a real repository buries the
+        # ten lines you came to look at.
+        want = set()
+        for path in changed:
+            d = path.rpartition("/")[0]
+            while d:
+                want.add(d)
+                d = d.rpartition("/")[0]
+        for dirpath, item in nodes.items():
+            item.setExpanded(dirpath in want)
+        self.tree.resizeColumnToContents(0)
+
+
 class HoodView(QWidget):
+    want_structure = pyqtSignal(str)
+    want_file_diff = pyqtSignal(str, str)
+
     """
     Everything the normal view deliberately hides.
 
@@ -672,7 +812,24 @@ class HoodView(QWidget):
         self.kernel = QPlainTextEdit(); self.kernel.setReadOnly(True)
         self.effects = QPlainTextEdit(); self.effects.setReadOnly(True)
         self.research = QPlainTextEdit(); self.research.setReadOnly(True)
+        self.treepage = QWidget()
+        tp = QVBoxLayout(self.treepage)
+        tp.setContentsMargins(0, 0, 0, 0)
+        tp.setSpacing(8)
+        self.treepick = QComboBox()
+        self.treepick.setObjectName("Mode")
+        self.treepick.currentIndexChanged.connect(self._tree_tx_changed)
+        row = QHBoxLayout()
+        row.addWidget(lab("Layer", "Muted", selectable=False))
+        row.addWidget(self.treepick)
+        row.addStretch(1)
+        tp.addLayout(row)
+        self.tree = FileTree()
+        self.tree.file_picked.connect(self._tree_file)
+        tp.addWidget(self.tree, 1)
+
         self.tabs.addTab(self.stackpage, "Live layers")
+        self.tabs.addTab(self.treepage, "File structure")
         self.tabs.addTab(self.kernel, "Kernel state")
         self.tabs.addTab(self.effects, "Intercepted effects")
         self.tabs.addTab(self.research, "Measurements")
@@ -681,6 +838,49 @@ class HoodView(QWidget):
         self._open_tx = None
 
         self.research.setPlainText(self._research())
+
+    def _tree_tx_changed(self, _i):
+        tx = self.treepick.currentData()
+        if tx:
+            self.want_structure.emit(str(tx))
+
+    def _tree_file(self, path):
+        """One file from the tree: show just that file's lines."""
+        tx = self.treepick.currentData()
+        if not tx:
+            return
+        one = [d for d in (self._diffs.get(str(tx)) or [])
+               if d.get("path") == path]
+        self.tabs.setCurrentIndex(0)
+        if one:
+            self.diffview.show_diff(tx, one)
+            self.diffhead.setText("%s in layer %s" % (path, tx))
+        else:
+            # The structure walk deliberately does not diff, so a file the
+            # diff pass skipped (it caps at 200) has no lines cached.
+            self.want_file_diff.emit(str(tx), path)
+
+    def set_structure(self, tx, struct):
+        self.tree.load(struct)
+
+    def set_layer_choices(self, live, agents):
+        cur = self.treepick.currentData()
+        want = [(str(t["tx"]), agents.get(str(t["tx"]))) for t in live]
+        have = [(self.treepick.itemData(i), self.treepick.itemText(i))
+                for i in range(self.treepick.count())]
+        if [w[0] for w in want] == [h[0] for h in have]:
+            return
+        self.treepick.blockSignals(True)
+        self.treepick.clear()
+        for tx, who in want:
+            self.treepick.addItem(
+                ("%s · layer %s" % (who, tx)) if who else "layer %s" % tx, tx)
+        self.treepick.blockSignals(False)
+        if want:
+            idx = max(0, [w[0] for w in want].index(cur)
+                      if cur in [w[0] for w in want] else 0)
+            self.treepick.setCurrentIndex(idx)
+            self.want_structure.emit(want[idx][0])
 
     def _show_tx(self, tx):
         self._open_tx = tx
@@ -1592,6 +1792,8 @@ class Main(QMainWindow):
         self.chat.decided.connect(self.decide)
         self.chat.submitted.connect(self.on_submit)
         self.hoodview = HoodView()
+        self.hoodview.want_structure.connect(self.fetch_structure)
+        self.hoodview.want_file_diff.connect(self.fetch_file_diff)
         self.stack.addWidget(self.chat)
         self.stack.addWidget(self.hoodview)
 
@@ -1696,6 +1898,28 @@ class Main(QMainWindow):
         if on:
             self.refresh_hood()
 
+    def fetch_structure(self, tx):
+        def got(res):
+            if isinstance(res, dict):
+                self.hoodview.set_structure(tx, res)
+        run_async(self, STRUCTURE, GUEST, tx, then=got)
+
+    def fetch_file_diff(self, tx, path):
+        """
+        Diff ONE file on demand.
+
+        The structure walk does not diff -- that is what makes it usable on
+        a real repository -- so clicking a file the bulk pass skipped has
+        to go and get it. One file, one call.
+        """
+        def got(res):
+            if isinstance(res, Exception) or not res:
+                return
+            one = [d for d in res if d.get("path") == path] or res[:1]
+            self.hoodview.diffview.show_diff(tx, one)
+            self.hoodview.diffhead.setText("%s in layer %s" % (path, tx))
+        run_async(self, GUEST.session_diff, tx, then=got)
+
     def refresh_hood(self):
         if not self.hood.isChecked():
             return
@@ -1717,6 +1941,8 @@ class Main(QMainWindow):
                 if isinstance(res, Exception):
                     return
                 self.hoodview.set_layers(snap, res, self._agent_of)
+                self.hoodview.set_layer_choices(snap.get("txlive") or [],
+                                                self._agent_of)
 
             def fetch(txs):
                 return {str(t): GUEST.session_diff(t) for t in txs}

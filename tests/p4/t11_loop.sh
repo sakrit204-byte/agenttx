@@ -108,6 +108,64 @@ grep -q '"type": "tx_turn_end"' "$TD/events.jsonl" \
 	&& ok "the turn still ends cleanly (no orphaned transaction)" \
 	|| bad "the turn never ended -- transaction left open"
 
+# --- 2b. repeated FAILURE with different arguments each time ------------
+# The exact-repeat check misses the commoner shape: several attempts at
+# the same idea, each slightly reworded, all failing identically. A 7B did
+# exactly this five times against `python3 -c` and never changed approach.
+cat > "$TD/s2b.json" <<'JSON'
+[{"_mode":"content","_when":"first","role":"assistant","content":"",
+  "tool_calls":[{"function":{"name":"read_file","arguments":{"path":"missing-a.txt"}}}]},
+ {"_when":"after_tool","role":"assistant","content":"",
+  "tool_calls":[{"function":{"name":"read_file","arguments":{"path":"missing-b.txt"}}}]}]
+JSON
+start_srv "$TD/s2b.json"
+MAXSTEPS=6 run_loop 6 "Keep failing differently"
+if grep -q 'failures in a row' "$TD/events.jsonl"; then
+	ok "repeated failures with different arguments are called out"
+else
+	bad "a tool failing repeatedly was never flagged"
+fi
+
+# --- 2c. an EMPTY response is not a finished task -----------------------
+# The worst failure this harness can have: the model returns no text and
+# no tool call, the loop calls that "done", and the run is reported as a
+# success that changed nothing. Observed on a real task.
+cat > "$TD/s2c.json" <<'JSON'
+[{"_mode":"content","_when":"first","role":"assistant","content":"","tool_calls":[]},
+ {"_when":"after_tool","role":"assistant","content":"","tool_calls":[]},
+ {"_when":"plan","role":"assistant","content":"","tool_calls":[]}]
+JSON
+start_srv "$TD/s2c.json"
+run_loop 7 "Do something"
+if grep -q 'stopped responding' "$TD/events.jsonl"; then
+	ok "an agent returning nothing is reported, not called finished"
+else
+	bad "an empty response was treated as a completed task"
+fi
+if grep -q '"subtype": "success"' "$TD/events.jsonl"; then
+	bad "a run that changed nothing was still labelled a success"
+else
+	ok "an empty run is not labelled a success"
+fi
+
+# --- 2d. "done" before anything was done --------------------------------
+# A small model stops to NARRATE the next step. One real run ended with
+# the text "2. run: python3 add_spdx.py" after writing the script but
+# never running it, and was reported complete having changed nothing.
+cat > "$TD/s2d.json" <<'JSON'
+[{"role":"assistant","content":"2. run: python3 add_spdx.py","tool_calls":[]},
+ {"role":"assistant","content":"",
+  "tool_calls":[{"function":{"name":"run","arguments":{"command":"echo did-it"}}}]},
+ {"role":"assistant","content":"Done, I ran it.","tool_calls":[]}]
+JSON
+start_srv "$TD/s2d.json"
+run_loop 8 "Narrate instead of acting"
+if grep -q 'did-it' "$TD/events.jsonl"; then
+	ok "an agent that narrated instead of acting is pushed to act"
+else
+	bad "the turn ended while nothing had been done"
+fi
+
 # --- 3. the step budget must be enforced --------------------------------
 cat > "$TD/s3.json" <<'JSON'
 [{"role":"assistant","content":"","tool_calls":[{"function":{"name":"run","arguments":{"command":"date +%N"}}}]}]

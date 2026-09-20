@@ -106,6 +106,16 @@ def edit_file(root: str, path: str, old: str, new: str) -> str:
     f = _resolve(root, path)
     if not os.path.isfile(f):
         raise ToolError("%s does not exist" % path)
+    if not old:
+        # An empty needle "occurs" between every pair of characters, so
+        # str.count returned len(file)+1 and the model was told its text
+        # appeared 2073 times in a 2072-byte file. A small model reaches
+        # for old:"" when it wants to PREPEND something, so say what to do
+        # instead of reporting an absurd number.
+        raise ToolError(
+            "old must not be empty. To add something at the top of a file, "
+            "read_file it and write_file the whole new contents. To change "
+            "many files at once, use run with a script.")
     with open(f, encoding="utf-8") as fh:
         body = fh.read()
     n = body.count(old)

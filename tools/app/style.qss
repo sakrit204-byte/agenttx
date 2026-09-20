@@ -171,3 +171,15 @@ QPushButton:disabled { color: #4b5666; border-color: #1c2531; background: #0e141
 #DiffView {
   background: #0a0e14; border: 1px solid #1c2531; border-radius: 8px;
 }
+
+#Tree {
+  background: #0a0e14; border: 1px solid #1c2531; border-radius: 8px;
+  color: #9fb0c3; font-size: 11.5px;
+  font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+}
+#Tree::item { padding: 2px 0; }
+#Tree::item:selected { background: #17202c; }
+QHeaderView::section {
+  background: #10161f; color: #6b7a8d; border: none;
+  border-bottom: 1px solid #1c2531; padding: 5px 8px; font-size: 11px;
+}
