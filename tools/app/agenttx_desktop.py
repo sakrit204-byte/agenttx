@@ -60,11 +60,11 @@ C = {
 STATUS = {
     "running":            ("#58a6ff", "working"),
     "starting":           ("#58a6ff", "starting"),
-    "awaiting-decision":  ("#d29922", "waiting for you"),
+    "awaiting-decision":  ("#d29922", "decide"),
     "committed":          ("#3fb950", "kept"),
     "aborted":            ("#8b9aad", "discarded"),
     "failed":             ("#f85149", "failed"),
-    "closed":             ("#6b7a8d", "no decision pending"),
+    "closed":             ("#6b7a8d", "done"),
 }
 
 
@@ -573,12 +573,14 @@ class Bubble(QFrame):
 
     def __init__(self, who: str, text: str, agent: str = ""):
         super().__init__()
-        self.setObjectName({"you": "YouMsg", "agent": "AgentMsg"}.get(
-            who, "ErrMsg"))
+        self.setObjectName({"you": "YouMsg", "agent": "AgentMsg",
+                            "notice": "NoteMsg",
+                            "conflict": "ConflictMsg"}.get(who, "ErrMsg"))
         v = QVBoxLayout(self)
         v.setContentsMargins(14, 11, 14, 11)
         v.setSpacing(5)
-        tag = {"you": "YOU", "agent": "AGENT", "problem": "PROBLEM"}[who]
+        tag = {"you": "YOU", "agent": "AGENT", "problem": "PROBLEM",
+               "notice": "SANDBOX", "conflict": "CONFLICT"}[who]
         # With a swarm running, "AGENT" alone is useless -- three of them
         # are talking and the whole question is which one did what.
         if agent:
@@ -846,7 +848,20 @@ class ChatView(QWidget):
             return
 
         if kind in ("tx_error", "tx_notice"):
-            self.add(Bubble("problem", (e.get("text") or "").strip()))
+            # A notice is not a problem. "Planning how to split this across
+            # 3 agents…" was rendering in the red PROBLEM style, which
+            # tells the reader something went wrong at the exact moment
+            # nothing has. Errors stay red; notices are information, and
+            # a conflict warning is its own thing again -- it is the one
+            # the person has to act on.
+            text = (e.get("text") or "").strip()
+            if kind == "tx_error":
+                who = "problem"
+            elif text.startswith("CONFLICT"):
+                who = "conflict"
+            else:
+                who = "notice"
+            self.add(Bubble(who, text))
             return
 
         if kind == "swarm_plan":
@@ -1338,9 +1353,19 @@ class Main(QMainWindow):
             wl.setContentsMargins(11, 9, 11, 9)
             wl.setSpacing(3)
             top = QHBoxLayout()
-            top.addWidget(lab(t.get("title") or "Task", bold=True))
+            title = t.get("title") or "Task"
+            # Elide here rather than letting the layout squeeze the pill:
+            # a long task title otherwise pushed the status off the edge
+            # and it rendered as "o decision pendin".
+            if len(title) > 26:
+                title = title[:25] + "…"
+            lb = lab(title, bold=True)
+            lb.setWordWrap(False)
+            top.addWidget(lb)
             top.addStretch(1)
-            top.addWidget(pill(word, colour))
+            pl = pill(word, colour)
+            pl.setMinimumWidth(58)
+            top.addWidget(pl)
             wl.addLayout(top)
             n = t.get("turns", 0)
             wl.addWidget(lab(f"{n} turn{'s' if n != 1 else ''}", "Muted"))

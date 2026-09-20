@@ -111,6 +111,62 @@ class Transcript:
         self._w(kw)
 
 
+def extract_call(text: str):
+    """
+    Pull a {"name": ..., "arguments": {...}} call out of model prose.
+
+    Returns the call dict, or None if the text is really an answer.
+
+    Deliberately strict about SHAPE and forgiving about WRAPPING: a model
+    that meant to answer in prose must not have a stray JSON-looking
+    fragment turned into a tool call, but one that fenced its call in
+    ```json, or prefixed it with "Let me look:", should still be
+    understood.
+    """
+    import re as _re
+
+    candidates = []
+    fence = _re.findall(r"```(?:json|tool_call)?\s*(\{.*?\})\s*```", text, _re.S)
+    candidates.extend(fence)
+    # Outermost brace span: a call carrying a nested "arguments" object
+    # cannot be found with a non-greedy match.
+    start = text.find("{")
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    candidates.append(text[start:i + 1])
+                    break
+    for c in candidates:
+        try:
+            o = json.loads(c)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(o, dict):
+            continue
+        # Accept both the bare shape and the OpenAI-ish wrapper some
+        # models copy from their training data.
+        if "function" in o and isinstance(o["function"], dict):
+            o = o["function"]
+        name = o.get("name")
+        if not isinstance(name, str) or name not in T.DISPATCH:
+            continue
+        args = o.get("arguments", o.get("parameters", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(args, dict):
+            continue
+        return {"name": name, "arguments": args}
+    return None
+
+
 def trim(messages: list[dict]) -> list[dict]:
     """
     Keep the conversation inside the model's window.
@@ -198,6 +254,28 @@ def main() -> int:
 
         calls = msg.get("tool_calls") or []
         content = (msg.get("content") or "").strip()
+
+        # A small model routinely writes the tool call into the prose.
+        #
+        # Ollama only fills `tool_calls` when the model's template
+        # supports tools, and several good 7Bs -- qwen2.5-coder among
+        # them -- have no such template. They emit exactly the right JSON
+        # in `content` instead:
+        #
+        #     {"name": "list_dir", "arguments": {"path": "."}}
+        #
+        # Without this the loop saw prose, concluded the model was done,
+        # and ended the turn having changed nothing. Observed on the very
+        # first real task: one "assistant" event holding a perfectly
+        # formed call, zero tools executed.
+        #
+        # Refusing to parse it would mean rejecting the model for a
+        # formatting detail it got right in substance.
+        if not calls and content:
+            parsed = extract_call(content)
+            if parsed:
+                calls = [{"function": parsed}]
+                content = ""      # it was a call, not an answer
 
         if content:
             t.text(content)

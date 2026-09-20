@@ -157,17 +157,37 @@ echo "---LIVE---"
 # count because that one genuinely IS cumulative -- a broken cycle is an
 # event that happened, not a thing that is.
 DBG=/sys/kernel/debug/agenttx
-printf 'opentx='; { tail -n +2 "$DBG/transactions" 2>/dev/null || true; } | grep -c . || true
+# `grep -c` PRINTS 0 and EXITS 1 when nothing matches, so the obvious
+# `grep -c . || echo 0` emits the count twice -- once from grep, once from
+# the fallback -- and the stray bare "0" shifted every line the parser read
+# after it.
+printf 'opentx='; { tail -n +2 "$DBG/transactions" 2>/dev/null || true; } | grep -c . | head -1
 printf 'upperfiles='; find /var/lib/agenttx -mindepth 3 -path '*/upper/*' -type f 2>/dev/null | wc -l
-printf 'wfg='; { tail -n +2 "$DBG/waitfor" 2>/dev/null || true; } | grep -c . || true
-printf 'deadlocks='; dmesg 2>/dev/null | grep -c 'aborting as a deadlock victim' || echo 0
+printf 'wfg='; { tail -n +2 "$DBG/waitfor" 2>/dev/null || true; } | grep -c . | head -1
+printf 'deadlocks='; dmesg 2>/dev/null | grep -c 'aborting as a deadlock victim' | head -1
+# Ask the model host what it is serving.
+#
+# This line MUST stay inside ---LIVE---. The first version sat after the
+# ---WFG--- marker, so the parser read "brain=..." as a wait-for edge and
+# the panel showed no model while one was plainly loaded and answering.
+#
+# python3 rather than sed: the sed worked when typed at a shell and
+# produced nothing from inside this script, and a JSON read that cannot be
+# broken by quoting is worth the extra process.
+printf 'brain='
+python3 - <<'TXBRAIN_EOF' 2>/dev/null || echo
+import json, urllib.request
+try:
+    with urllib.request.urlopen("http://10.0.2.2:11434/api/tags", timeout=3) as r:
+        m = json.load(r).get("models") or []
+    print(m[0].get("name", "") if m else "no model pulled")
+except Exception:
+    print("")
+TXBRAIN_EOF
 echo "---WFG---"
 tail -n +2 "$DBG/waitfor" 2>/dev/null | head -40 || true
 echo "---TXLIVE---"
 tail -n +2 "$DBG/transactions" 2>/dev/null | head -40 || true
-printf 'brain='; curl -s --max-time 2 http://10.0.2.2:11434/api/tags 2>/dev/null \
-  | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1 || true
-echo
 echo "---END---"
 """ % "%s"
 
@@ -448,13 +468,13 @@ find "$U" -mindepth 1 2>/dev/null | sort | while read -r f; do
     del=$(diff --unchanged-line-format= --old-line-format=x --new-line-format= "$old" "$f" 2>/dev/null | wc -c)
     echo "ENTRY modified $rel"
     echo "STAT $add $del $(stat -c %%s "$f" 2>/dev/null || echo 0)"
-    diff -u "$old" "$f" 2>/dev/null | head -40 | sed 's/^/D /'
+    diff -u "$old" "$f" 2>/dev/null | head -40 | awk '{print "D " $0}' 
     echo "PREVIEW-END"
   else
     n=$(wc -l < "$f" 2>/dev/null || echo 0)
     echo "ENTRY created $rel"
     echo "STAT $n 0 $(stat -c %%s "$f" 2>/dev/null || echo 0)"
-    head -24 "$f" 2>/dev/null | sed 's/^/D /'
+    head -24 "$f" 2>/dev/null | awk '{print "D " $0}' 
     echo "PREVIEW-END"
   fi
 done

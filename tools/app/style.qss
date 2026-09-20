@@ -127,3 +127,13 @@ QTabBar::tab:selected { background: #161d27; color: #e6edf3; }
 #LiveStrip { background: #0d131b; border-top: 1px solid #1c2531; }
 #LiveVal { color: #9fb0c3; font-size: 11px;
            font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace; }
+
+/* A notice is information, not a failure. */
+#NoteMsg {
+  background: #101821; border: 1px solid #1f2d3d;
+  border-left: 3px solid #6b7a8d; border-radius: 10px;
+}
+#ConflictMsg {
+  background: #1d1a14; border: 1px solid #4a3a1f;
+  border-left: 3px solid #d29922; border-radius: 10px;
+}
