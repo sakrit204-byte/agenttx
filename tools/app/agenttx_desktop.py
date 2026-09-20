@@ -731,6 +731,10 @@ class ChatView(QWidget):
             self.input.clear()
             self.submitted.emit(text)
 
+    def _decide_one(self, tx, what):
+        """A single agent's transaction, from the swarm result card."""
+        self.decided.emit(tx, what)
+
     def _decide(self, what):
         if self.tx:
             self.keep.setEnabled(False)
@@ -896,11 +900,41 @@ class ChatView(QWidget):
             else:
                 v.addWidget(lab("%d agents finished, no overlapping files"
                                 % len(agents), bold=True))
+            # One decision PER AGENT.
+            #
+            # Each agent holds its own transaction, so "keep" and
+            # "discard" are per-agent answers, not one answer for the
+            # run. That is the entire reason they were given separate
+            # transactions: when two of them collide you keep the one you
+            # wanted and drop the other, without re-running anything.
+            # A single bar at the bottom cannot express that.
             for ag in agents:
-                v.addWidget(lab("%s (tx %s): %s"
-                                % (ag.get("name"), ag.get("tx") or "?",
-                                   ", ".join(ag.get("files") or []) or "nothing"),
-                                "Muted", wrap=True))
+                row = QHBoxLayout()
+                row.setSpacing(8)
+                files = ", ".join(ag.get("files") or []) or "nothing"
+                row.addWidget(lab("<b>%s</b> (tx %s): %s"
+                                  % (ag.get("name"), ag.get("tx") or "?",
+                                     files), wrap=True), 1)
+                tx = ag.get("tx")
+                if tx and ag.get("files"):
+                    d = QPushButton("Discard")
+                    d.setObjectName("Discard")
+                    k = QPushButton("Keep")
+                    k.setObjectName("Commit")
+                    d.clicked.connect(
+                        lambda _=False, t=tx: self._decide_one(t, "abort"))
+                    k.clicked.connect(
+                        lambda _=False, t=tx: self._decide_one(t, "commit"))
+                    row.addWidget(d)
+                    row.addWidget(k)
+                holder = QWidget()
+                holder.setLayout(row)
+                v.addWidget(holder)
+            if conflicts:
+                v.addWidget(lab(
+                    "Keeping both is the one choice that loses work: "
+                    "whichever you keep second overwrites the first.",
+                    "Warn", wrap=True))
             self.add(box)
             return
 
@@ -942,7 +976,7 @@ class ChatView(QWidget):
         self.live["dead"].setText(str(snap.get("deadlocks", 0)))
         self.live["model"].setText(snap.get("brain") or "—")
 
-    def set_review(self, tx, status, diff):
+    def set_review(self, tx, status, diff, swarm=False):
         """
         Put the change report at the end of the conversation.
 
@@ -953,6 +987,12 @@ class ChatView(QWidget):
         rubber stamp.
         """
         self.tx = tx
+        if swarm:
+            # Several transactions are open; each is decided on its own
+            # row in the swarm card. One bar deciding an arbitrary one of
+            # them would be worse than no bar.
+            self.bar.hide()
+            return
         if status != "awaiting-decision" or not diff:
             self.bar.hide()
             if self._review is not None and status in ("committed", "aborted"):
@@ -1265,10 +1305,15 @@ class Main(QMainWindow):
             self.chat.set_review(tx, s.get("status"), [])
             return
 
+        # More than one open transaction for this thread means a swarm is
+        # waiting, and each agent is decided on its own row.
+        swarm = sum(1 for x in self.sessions
+                    if x.get("status") == "awaiting-decision") > 1
+
         def gotdiff(diff):
             if isinstance(diff, Exception):
                 return
-            self.chat.set_review(tx, "awaiting-decision", diff)
+            self.chat.set_review(tx, "awaiting-decision", diff, swarm)
         run_async(self, GUEST.session_diff, tx, then=gotdiff)
 
     def rebuild_list(self):
