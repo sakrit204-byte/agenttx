@@ -45,7 +45,7 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout,  # noqa: E402
                              QMainWindow, QPlainTextEdit, QPushButton,
                              QScrollArea, QSizePolicy, QSplitter,
                              QComboBox, QStackedWidget, QTabWidget,
-                             QVBoxLayout, QWidget)
+                             QTextEdit, QVBoxLayout, QWidget)
 
 from guest import AgentThreads, GuestLink  # noqa: E402
 
@@ -69,7 +69,7 @@ STATUS = {
 
 
 # ---------------------------------------------------------------- helpers
-def lab(text, obj=None, wrap=False, size=None, bold=False):
+def lab(text, obj=None, wrap=False, size=None, bold=False, selectable=True):
     w = QLabel(text)
     if obj:
         w.setObjectName(obj)
@@ -80,7 +80,18 @@ def lab(text, obj=None, wrap=False, size=None, bold=False):
             f.setPointSize(size)
         f.setBold(bold)
         w.setFont(f)
-    w.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    # Selectable text CONSUMES mouse events.
+    #
+    # The task list is built from QLabels inside a QListWidget item
+    # widget, and a selectable QLabel swallows the press before it ever
+    # reaches the item -- so clicking a task in the sidebar did nothing at
+    # all and the only way to change conversation was to wait for the
+    # poller to pick a different one. Selecting text matters in the
+    # transcript, where people copy an agent's explanation; it is useless
+    # on a three-line list row.
+    w.setTextInteractionFlags(
+        Qt.TextInteractionFlag.TextSelectableByMouse if selectable
+        else Qt.TextInteractionFlag.NoTextInteraction)
     return w
 
 
@@ -313,6 +324,311 @@ class FileCard(QFrame):
 
 # ---------------------------------------------------------------- review view
 # ---------------------------------------------------------------- under the hood
+# ------------------------------------------------------- the layer picture
+#
+# What a copy-on-write transaction IS, drawn rather than described.
+#
+# The hood used to be a wall of monospace. It was accurate and almost
+# nobody could read it, which defeats the purpose: this panel exists so a
+# person can SEE that the agent's changes are not in their folder yet. The
+# thing that makes that obvious is the shape of the stack -- your real
+# files underneath, one private layer per agent stacked on top, nothing
+# flowing down until you say so.
+#
+# Hover a layer for what that agent did; click it for the actual lines,
+# coloured the way a diff is always coloured.
+
+
+class FileChip(QFrame):
+    """One changed file inside a layer."""
+
+    KIND = {
+        "created":  ("#3fb950", "new"),
+        "modified": ("#d29922", "edited"),
+        "deleted":  ("#f85149", "deleted"),
+        "dir":      ("#6b7a8d", "folder"),
+    }
+
+    def __init__(self, d):
+        super().__init__()
+        self.setObjectName("Chip")
+        colour, word = self.KIND.get(d.get("kind"), ("#8b9aad", d.get("kind")))
+        self.setStyleSheet(
+            "#Chip { background: %s18; border: 1px solid %s55;"
+            " border-radius: 6px; }" % (colour, colour))
+        h = QHBoxLayout(self)
+        h.setContentsMargins(8, 4, 8, 4)
+        h.setSpacing(7)
+        dot = QLabel("●")
+        dot.setStyleSheet("color: %s; font-size: 9px; background: transparent;"
+                          % colour)
+        # Without a fixed width the dot's label expands and leaves a wide
+        # blank gap before the filename, which reads as a rendering fault.
+        dot.setFixedWidth(9)
+        h.addWidget(dot)
+        name = lab(d.get("path", "?"), selectable=False)
+        name.setStyleSheet(
+            "color: #e6edf3; font-size: 11.5px; background: transparent;")
+        h.addWidget(name, 1)
+        a, r = int(d.get("added") or 0), int(d.get("removed") or 0)
+        if a or r:
+            counts = lab("+%d −%d" % (a, r), selectable=False)
+            counts.setStyleSheet(
+                "color: #8b9aad; font-size: 10.5px; background: transparent;"
+                " font-family: 'DejaVu Sans Mono', monospace;")
+            h.addWidget(counts)
+        else:
+            w = lab(word, selectable=False)
+            w.setStyleSheet("color: %s; font-size: 10.5px;"
+                            " background: transparent;" % colour)
+            h.addWidget(w)
+
+
+class TxCard(QFrame):
+    """One transaction: one agent's private layer."""
+
+    clicked = pyqtSignal(str)
+    hovered = pyqtSignal(str)
+
+    def __init__(self, tx, agent, state, diff, lower):
+        super().__init__()
+        self.tx = str(tx)
+        self.setObjectName("TxCard")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumWidth(240)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(13, 11, 13, 11)
+        v.setSpacing(7)
+
+        head = QHBoxLayout()
+        head.setSpacing(7)
+        who = lab(agent or ("transaction %s" % tx), bold=True, selectable=False)
+        who.setStyleSheet("color: #e6edf3; font-size: 12.5px;")
+        head.addWidget(who)
+        head.addStretch(1)
+        colour = {"active": "#58a6ff", "committing": "#d29922",
+                  "doomed": "#f85149"}.get(state, "#8b9aad")
+        head.addWidget(pill(state or "open", colour))
+        v.addLayout(head)
+
+        v.addWidget(lab("layer %s · on top of %s" % (tx, lower or "?"),
+                        "Muted", selectable=False))
+
+        if diff:
+            for d in diff[:8]:
+                v.addWidget(FileChip(d))
+            if len(diff) > 8:
+                v.addWidget(lab("+%d more" % (len(diff) - 8), "Muted",
+                                selectable=False))
+        else:
+            v.addWidget(lab("nothing changed yet", "Muted", selectable=False))
+
+        v.addWidget(lab("click to see the lines", "Muted", selectable=False))
+
+    def enterEvent(self, e):
+        self.setProperty("hover", True)
+        self.style().unpolish(self); self.style().polish(self)
+        self.hovered.emit(self.tx)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self.setProperty("hover", False)
+        self.style().unpolish(self); self.style().polish(self)
+        super().leaveEvent(e)
+
+    def mousePressEvent(self, e):
+        self.clicked.emit(self.tx)
+        super().mousePressEvent(e)
+
+
+class DiffView(QTextEdit):
+    """
+    A diff, coloured the way diffs are always coloured.
+
+    QTextEdit rather than QPlainTextEdit: the plain widget cannot render
+    HTML at all, and the colouring is the entire point of this pane.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.setReadOnly(True)
+        self.setObjectName("DiffView")
+        self.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+
+    def show_diff(self, tx, diff):
+        if not diff:
+            self.setPlainText("Transaction %s has changed nothing." % tx)
+            return
+        # Built as HTML rather than by walking a QTextCursor: this is
+        # redrawn on every poll while agents work, and per-line cursor
+        # formatting on a few hundred lines is visibly slow.
+        out = []
+        for d in diff:
+            kind = d.get("kind")
+            head = {"created": "new file", "modified": "edited",
+                    "deleted": "deleted", "dir": "new folder"}.get(kind, kind)
+            out.append(
+                "<div style='color:#e6edf3;font-weight:600;margin-top:10px'>"
+                "%s &nbsp;<span style='color:#8b9aad;font-weight:400'>(%s)"
+                "</span></div>" % (esc(d.get("path", "?")), head))
+            if kind == "deleted":
+                out.append("<div style='color:#f85149'>"
+                           "this file is removed in this layer</div>")
+            for line in (d.get("preview") or [])[:200]:
+                out.append(diff_line_html(line, kind))
+        self.setHtml(
+            "<body style=\"font-family:'JetBrains Mono','DejaVu Sans Mono',"
+            "monospace;font-size:11.5px;background:#0a0e14\">"
+            + "".join(out) + "</body>")
+
+
+def esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;"))
+
+
+def diff_line_html(line, kind):
+    """
+    Colour one line the way git does.
+
+    A created file has no diff markers -- every line of it is new -- so it
+    is coloured entirely as an addition. Without that special case a brand
+    new file rendered as flat grey text, which is the exact moment somebody
+    most wants to see "all of this is new".
+    """
+    # Qt's rich text does NOT understand 8-digit hex (#RRGGBBAA).
+    #
+    # The first version tinted these lines with #3fb95012 and #f8514912,
+    # which Qt could not parse, so added and removed lines came out the
+    # same muddy colour and the one thing this pane exists to show -- what
+    # went in and what came out -- was unreadable. These are flat, opaque
+    # colours picked to sit on the #0a0e14 background.
+    ADD_BG, DEL_BG = "#0d2417", "#2b1417"
+    ADD_FG, DEL_FG = "#56d364", "#ff7b72"
+
+    body = esc(line) or "&nbsp;"
+    row = ("<div style='color:%s;background-color:%s;"
+           "white-space:pre'>%s</div>")
+    if kind == "created":
+        return row % (ADD_FG, ADD_BG, "+ " + body)
+    if line.startswith("+++") or line.startswith("---"):
+        return "<div style='color:#6b7a8d;white-space:pre'>%s</div>" % body
+    if line.startswith("@@"):
+        return ("<div style='color:#79c0ff;margin-top:8px;"
+                "white-space:pre'>%s</div>" % body)
+    if line.startswith("+"):
+        return row % (ADD_FG, ADD_BG, body)
+    if line.startswith("-"):
+        return row % (DEL_FG, DEL_BG, body)
+    return "<div style='color:#8b9aad;white-space:pre'>%s</div>" % body
+
+
+class LayerStack(QWidget):
+    """The picture: your folder underneath, the agents' layers on top."""
+
+    show_tx = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._sig = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(10)
+
+        self.caption = lab("", "Sub", wrap=True)
+        v.addWidget(self.caption)
+
+        # --- the layers the agents write into -------------------------
+        self.layerbox = QFrame()
+        self.layerbox.setObjectName("LayerBox")
+        lb = QVBoxLayout(self.layerbox)
+        lb.setContentsMargins(13, 11, 13, 13)
+        lb.setSpacing(8)
+        lb.addWidget(lab("SANDBOX LAYERS — one per agent, private to it",
+                         "Muted", selectable=False))
+        self.cards = QHBoxLayout()
+        self.cards.setSpacing(10)
+        lb.addLayout(self.cards)
+        v.addWidget(self.layerbox)
+
+        self.arrow = lab("nothing flows down until you press Keep",
+                         "Muted", selectable=False)
+        self.arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(self.arrow)
+
+        # --- the real folder ------------------------------------------
+        self.realbox = QFrame()
+        self.realbox.setObjectName("RealBox")
+        rb = QVBoxLayout(self.realbox)
+        rb.setContentsMargins(13, 11, 13, 11)
+        rb.setSpacing(5)
+        rb.addWidget(lab("YOUR REAL FOLDER — untouched", "Muted",
+                         selectable=False))
+        self.realfiles = lab("", selectable=False)
+        self.realfiles.setWordWrap(True)
+        self.realfiles.setStyleSheet("color:#9fb0c3;font-size:11.5px;")
+        rb.addWidget(self.realfiles)
+        v.addWidget(self.realbox)
+
+        self.hint = lab("", "Muted", wrap=True)
+        v.addWidget(self.hint)
+        v.addStretch(1)
+
+    def clear_cards(self):
+        while self.cards.count():
+            it = self.cards.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+
+    def update(self, snap, diffs, agents):
+        live = snap.get("txlive") or []
+        sig = (tuple(sorted(t["tx"] for t in live)),
+               tuple(sorted((k, len(v or [])) for k, v in diffs.items())))
+        if sig == self._sig:
+            return
+        self._sig = sig
+        self.clear_cards()
+
+        if not live:
+            self.caption.setText(
+                "No transaction is open. When an agent runs, a private "
+                "layer appears here for it.")
+            self.cards.addWidget(lab("— no open layers —", "Muted",
+                                     selectable=False))
+        else:
+            n = len(live)
+            self.caption.setText(
+                "%d layer%s open. Each agent writes into its own, so none "
+                "of them can see or overwrite another's work, and none of "
+                "it has reached your folder."
+                % (n, "s are" if n != 1 else " is"))
+            lowers = {d["tx"]: d.get("lower") for d in (snap.get("txdirs") or [])}
+            for t in live:
+                tx = t["tx"]
+                c = TxCard(tx, agents.get(str(tx)), t.get("state"),
+                           diffs.get(str(tx)), lowers.get(tx))
+                c.clicked.connect(self.show_tx.emit)
+                self.cards.addWidget(c)
+            self.cards.addStretch(1)
+
+        # What is actually in the folder underneath. The snapshot already
+        # walks it for the LOWER section; a placeholder string here was
+        # the one part of this picture that was not read from the system.
+        names = sorted({e.get("path") for e in (snap.get("lower") or [])
+                        if e.get("path")})
+        if names:
+            shown = "   ".join(names[:18])
+            if len(names) > 18:
+                shown += "   +%d more" % (len(names) - 18)
+            self.realfiles.setText(shown)
+        else:
+            self.realfiles.setText(
+                "(empty, or nothing readable underneath)")
+        self.hint.setText(
+            "Hover a layer to see what that agent did. Click it for the "
+            "actual lines, with additions in green and removals in red.")
+
+
 class HoodView(QWidget):
     """
     Everything the normal view deliberately hides.
@@ -336,14 +652,51 @@ class HoodView(QWidget):
         self.tabs = QTabWidget()
         v.addWidget(self.tabs, 1)
 
+        # The picture first. The text tabs stay, because when something is
+        # wrong the monospace dump is what you actually need -- but it is
+        # not what somebody should meet first.
+        self.stackpage = QWidget()
+        sp = QVBoxLayout(self.stackpage)
+        sp.setContentsMargins(0, 0, 0, 0)
+        sp.setSpacing(8)
+        self.stack_view = LayerStack()
+        self.diffview = DiffView()
+        self.diffview.setMinimumHeight(220)
+        self.diffhead = lab("Click a layer above to see its lines", "Muted",
+                            selectable=False)
+        self.stack_view.show_tx.connect(self._show_tx)
+        sp.addWidget(self.stack_view, 1)
+        sp.addWidget(self.diffhead)
+        sp.addWidget(self.diffview, 1)
+
         self.kernel = QPlainTextEdit(); self.kernel.setReadOnly(True)
         self.effects = QPlainTextEdit(); self.effects.setReadOnly(True)
         self.research = QPlainTextEdit(); self.research.setReadOnly(True)
+        self.tabs.addTab(self.stackpage, "Live layers")
         self.tabs.addTab(self.kernel, "Kernel state")
         self.tabs.addTab(self.effects, "Intercepted effects")
         self.tabs.addTab(self.research, "Measurements")
+        self._diffs = {}
+        self._agents = {}
+        self._open_tx = None
 
         self.research.setPlainText(self._research())
+
+    def _show_tx(self, tx):
+        self._open_tx = tx
+        who = self._agents.get(str(tx))
+        self.diffhead.setText(
+            "Layer %s%s — green is added, red is removed. None of it is in "
+            "your folder yet." % (tx, (" · " + who) if who else ""))
+        self.diffview.show_diff(tx, self._diffs.get(str(tx)))
+
+    def set_layers(self, snap, diffs, agents):
+        self._diffs = diffs
+        self._agents = agents
+        self.stack_view.update(snap, diffs, agents)
+        if self._open_tx:
+            self.diffview.show_diff(self._open_tx,
+                                    diffs.get(str(self._open_tx)))
 
     @staticmethod
     def _research():
@@ -621,6 +974,8 @@ class ChatView(QWidget):
         self.thread_id = None
         self._review = None                 # the change-report block, if any
         self._review_sig = None
+        self._decide_rows = {}              # tx -> (discard, keep, note)
+        self._is_swarm = False              # did this turn fan out?
         self._tools = {}                    # tool_use_id -> ToolCard
         self._last_bubble = None
         self._seen_turns = set()
@@ -640,6 +995,38 @@ class ChatView(QWidget):
         hv.addWidget(self.where)
         root.addWidget(head)
 
+        # Shown when no conversation is open. This is where the folder is
+        # chosen, because that is the one decision a new task genuinely
+        # needs and asking for it here means the header does not have to.
+        self.welcome = QFrame()
+        self.welcome.setObjectName("Welcome")
+        wv = QVBoxLayout(self.welcome)
+        wv.setContentsMargins(40, 40, 40, 40)
+        wv.setSpacing(12)
+        wv.addStretch(1)
+        wv.addWidget(lab("What should the agent do?", "Headline"))
+        wv.addWidget(lab(
+            "Describe it below and press Enter. The agent decides what to "
+            "run and keeps going until it is done — with no permission "
+            "prompts, because nothing it writes is real until you press "
+            "Keep.", "Sub", wrap=True))
+        fr = QHBoxLayout()
+        fr.setSpacing(9)
+        fr.addWidget(lab("Folder it may change", "Muted", selectable=False))
+        self.dirin = QLineEdit("/tmp/work")
+        self.dirin.setObjectName("DirInput")
+        self.dirin.setMaximumWidth(280)
+        self.dirin.setToolTip(
+            "The only folder the agent is allowed to change.\n"
+            "Everything it writes here goes into a sandbox layer first.")
+        fr.addWidget(self.dirin)
+        fr.addStretch(1)
+        wv.addLayout(fr)
+        wv.addWidget(lab(
+            "A leading <b>$</b> runs one shell command instead, using no "
+            "model and costing nothing.", "Muted", wrap=True))
+        wv.addStretch(2)
+
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setObjectName("ChatScroll")
@@ -649,7 +1036,12 @@ class ChatView(QWidget):
         self.col.setSpacing(10)
         self.col.addStretch(1)
         self.scroll.setWidget(self.inner)
-        root.addWidget(self.scroll, 1)
+
+        # welcome OR transcript, never both
+        self.pane = QStackedWidget()
+        self.pane.addWidget(self.welcome)
+        self.pane.addWidget(self.scroll)
+        root.addWidget(self.pane, 1)
 
         # --- the decision, when there is one --------------------------
         self.bar = QFrame()
@@ -735,7 +1127,43 @@ class ChatView(QWidget):
 
     def _decide_one(self, tx, what):
         """A single agent's transaction, from the swarm result card."""
+        row = self._decide_rows.get(str(tx))
+        if row:
+            d, k, note = row
+            d.setEnabled(False)
+            k.setEnabled(False)
+            note.setText("applying…")
         self.decided.emit(tx, what)
+
+    def sync_decisions(self, sessions):
+        """
+        Keep the per-agent buttons honest about what still exists.
+
+        A transaction only waits for a person while its session is alive.
+        Close the app on a review screen and the watchdog reaps it 90s
+        later; reopen the app and the swarm card is still sitting there
+        offering Keep and Discard for transactions the kernel has already
+        forgotten. Pressing them wrote a decision into a directory nobody
+        was reading, and the app gave no sign either way -- which is
+        exactly how this was reported: "why cant i press this".
+        """
+        live = {str(x.get("tx")): (x.get("status") or "")
+                for x in (sessions or [])}
+        for tx, (d, k, note) in self._decide_rows.items():
+            st = live.get(tx)
+            if st == "awaiting-decision":
+                if not note.text() == "applying…":
+                    d.setEnabled(True)
+                    k.setEnabled(True)
+                    note.setText("")
+            elif st in ("committed", "aborted"):
+                d.setEnabled(False)
+                k.setEnabled(False)
+                note.setText("kept" if st == "committed" else "discarded")
+            else:
+                d.setEnabled(False)
+                k.setEnabled(False)
+                note.setText("expired — no longer open")
 
     def _decide(self, what):
         if self.tx:
@@ -752,6 +1180,8 @@ class ChatView(QWidget):
         self.thread_id = thread.get("id") if thread else None
         self._review = None
         self._review_sig = None
+        self._decide_rows = {}
+        self._is_swarm = False
         self._tools.clear()
         self._last_bubble = None
         self._seen_turns.clear()
@@ -760,14 +1190,22 @@ class ChatView(QWidget):
             if it.widget():
                 it.widget().deleteLater()
         if thread:
+            self.pane.setCurrentIndex(1)
             self.title.setText(thread.get("title") or "Task")
             self.where.setText(
                 f"agent may only change {thread.get('lower','?')}  ·  "
                 f"{thread.get('turns',0)} turn"
                 f"{'s' if thread.get('turns',0) != 1 else ''}")
+            self.input.setPlaceholderText(
+                "Reply to the agent…    ($ runs a shell command instead)")
         else:
-            self.title.setText("No task open")
+            self.pane.setCurrentIndex(0)
+            self.title.setText("New chat")
             self.where.setText("")
+            self.bar.hide()
+            self.input.setPlaceholderText(
+                "Describe the task…    ($ runs a shell command instead)")
+        self.input.setFocus()
 
     def at_bottom(self) -> bool:
         b = self.scroll.verticalScrollBar()
@@ -891,6 +1329,7 @@ class ChatView(QWidget):
             return
 
         if kind == "swarm_result":
+            self._is_swarm = True
             box = QFrame()
             conflicts = e.get("conflicts") or []
             box.setObjectName("Conflict" if conflicts else "Plan")
@@ -942,6 +1381,14 @@ class ChatView(QWidget):
                         lambda _=False, t=tx: self._decide_one(t, "commit"))
                     row.addWidget(d)
                     row.addWidget(k)
+                    note = lab("", "Muted", selectable=False)
+                    row.addWidget(note)
+                    # Remember them so a transaction that goes away can
+                    # take its own buttons with it. A button that looks
+                    # live and does nothing is worse than no button: it
+                    # was pressed, nothing happened, and the app said
+                    # nothing about why.
+                    self._decide_rows[str(tx)] = (d, k, note)
                 holder = QWidget()
                 holder.setLayout(row)
                 v.addWidget(holder)
@@ -1055,6 +1502,9 @@ class Main(QMainWindow):
         self._since = {}                # thread id -> transcript lines read
         self._rendered = None           # thread id currently drawn
         self._fetching = set()          # thread ids with a fetch in flight
+        self._want_new = False          # user asked for an empty chat
+        self._live_tx = None            # tx ids the kernel actually has
+        self._agent_of = {}             # tx -> agent name, from swarm events
         self._last_sig = None
         self._busy = False
 
@@ -1078,6 +1528,31 @@ class Main(QMainWindow):
         brand.addWidget(lab("run an agent without asking it to ask", "Tagline"))
         top.addLayout(brand)
         top.addStretch(1)
+
+        # ONE button, not a form.
+        #
+        # The header used to carry a folder field, a task field and a Start
+        # button, which asked for three decisions before anything could
+        # happen and duplicated the composer at the bottom. A chat app has
+        # one place you type. This is the only thing the header still needs
+        # to offer: somewhere new to type.
+        self.newchat = QPushButton("＋  New chat")
+        self.newchat.setObjectName("NewChat")
+        self.newchat.clicked.connect(self.new_chat)
+        top.addWidget(self.newchat)
+
+        self.mode = QComboBox()
+        self.mode.setObjectName("Mode")
+        self.mode.addItem("1 agent", ("local", 1))
+        self.mode.addItem("2 agents at once", ("swarm", 2))
+        self.mode.addItem("3 agents at once", ("swarm", 3))
+        self.mode.addItem("5 agents at once", ("swarm", 5))
+        self.mode.setToolTip(
+            "Each agent gets its OWN transaction on the same folder.\n"
+            "If two of them change the same file, you are told before\n"
+            "you keep anything.")
+        top.addWidget(self.mode)
+
         self.linkpill = pill("connecting…", "#8b9aad")
         self.linkpill.setMinimumWidth(150)
         top.addWidget(self.linkpill)
@@ -1088,48 +1563,6 @@ class Main(QMainWindow):
         top.addWidget(self.hood)
         hv.addLayout(top)
 
-        row = QHBoxLayout()
-        row.setSpacing(9)
-        self.dirin = QLineEdit("/tmp/work")
-        self.dirin.setObjectName("DirInput")
-        self.dirin.setMaximumWidth(220)
-        self.dirin.setToolTip(
-            "The only folder the agent is allowed to change.\n"
-            "Everything it writes here goes into a sandbox layer first.")
-        self.taskin = QLineEdit()
-        self.taskin.setObjectName("TaskInput")
-        self.taskin.setPlaceholderText(
-            "Start a new task…   e.g. add a README explaining this folder")
-        self.taskin.returnPressed.connect(self.new_task)
-        self.mode = QComboBox()
-        self.mode.setObjectName("Mode")
-        # The label says what it DOES, not what it is called internally.
-        # "swarm" means nothing to somebody looking at this for the first
-        # time; "3 agents at once" is the same thing and explains itself.
-        self.mode.addItem("1 agent", ("local", 1))
-        self.mode.addItem("2 agents at once", ("swarm", 2))
-        self.mode.addItem("3 agents at once", ("swarm", 3))
-        self.mode.addItem("5 agents at once", ("swarm", 5))
-        self.mode.setToolTip(
-            "Each agent gets its OWN transaction on the same folder.\n"
-            "If two of them change the same file, you are told before\n"
-            "you keep anything.")
-        self.go = QPushButton("Start task")
-        self.go.setObjectName("Dispatch")
-        self.go.clicked.connect(self.new_task)
-        row.addWidget(self.dirin)
-        row.addWidget(self.taskin, 1)
-        row.addWidget(self.mode)
-        row.addWidget(self.go)
-        hv.addLayout(row)
-        hv.addWidget(lab(
-            "You describe the task; <b>the agent decides what to run and "
-            "keeps going until it is done</b> — no permission prompts, "
-            "because nothing it writes is real until you press Keep. "
-            "Every step it takes is on the right. "
-            "<span style='color:#4b5666'>(A leading <b>$</b> runs one shell "
-            "command instead, using no model and costing nothing.)</span>",
-            "Muted", wrap=True))
         rv.addWidget(hdr)
 
         # --- body -----------------------------------------------------
@@ -1149,7 +1582,7 @@ class Main(QMainWindow):
         self.stack = QStackedWidget()
         self.chat = ChatView()
         self.chat.decided.connect(self.decide)
-        self.chat.submitted.connect(self.follow_up)
+        self.chat.submitted.connect(self.on_submit)
         self.hoodview = HoodView()
         self.stack.addWidget(self.chat)
         self.stack.addWidget(self.hoodview)
@@ -1182,43 +1615,62 @@ class Main(QMainWindow):
     # agent learned in the earlier turns. Each turn still gets its own
     # transaction, so "keep turn 1, throw away turn 2" is a thing you can
     # actually do.
-    def new_task(self):
-        task = self.taskin.text().strip()
-        d = self.dirin.text().strip()
-        if not task or not d or self._busy:
+    def new_chat(self):
+        """Open an empty conversation. Nothing starts until you type."""
+        # Without this the next poll (1 Hz) runs rebuild_list, sees no
+        # selection, helpfully selects the newest thread, and the empty
+        # chat you just asked for vanishes about a second after you asked
+        # for it.
+        self._want_new = True
+        self.selected = None
+        self._rendered = None
+        self.list.blockSignals(True)
+        self.list.setCurrentRow(-1)
+        self.list.blockSignals(False)
+        self.chat.reset(None)
+
+    def on_submit(self, text):
+        """
+        The composer is the only place you type.
+
+        With a conversation open this continues it; with none open it
+        starts one. The header used to have its own task field, so there
+        were two boxes doing the same job and the answer to "where do I
+        type" depended on what was on screen.
+        """
+        if self._busy:
+            return
+        t = self._thread(self.selected)
+        if t:
+            self._start(t["id"], t.get("lower") or self.chat.dirin.text().strip(),
+                        text, t.get("title") or "Task", sid=t.get("sid"))
+            return
+        d = self.chat.dirin.text().strip()
+        if not d:
             return
         tid = "t%d-%s" % (int(time.time()), uuid.uuid4().hex[:6])
-        title = task[:70] + ("…" if len(task) > 70 else "")
-        self.taskin.clear()
+        title = text[:70] + ("…" if len(text) > 70 else "")
+        self._want_new = False
         self.selected = tid
         self._since[tid] = 0
         self._rendered = None
-        self._start(tid, d, task, title)
-
-    def follow_up(self, text):
-        t = self._thread(self.selected)
-        if not t or self._busy:
-            return
-        self._start(t["id"], t.get("lower") or self.dirin.text().strip(),
-                    text, t.get("title") or "Task", sid=t.get("sid"))
+        self._start(tid, d, text, title)
 
     def _start(self, tid, lower, text, title, sid=None):
         self._busy = True
-        self.go.setEnabled(False)
-        self.go.setText("starting…")
         self.chat.send.setEnabled(False)
+        self.chat.send.setText("…")
 
-        # A leading "$" is the no-model path: run exactly this command, bill
-        # nothing, and still get the transaction and the transcript. It is
-        # also the control arm -- see tools/harness/tx-shell.sh.
+        # A leading "$" is the no-model path: run exactly this command,
+        # bill nothing, and still get the transaction and the transcript.
+        # It is also the control arm -- see tools/harness/tx-shell.sh.
         shell = text.startswith("$")
         payload = text[1:].strip() if shell else text
 
         def done(_res):
             self._busy = False
-            self.go.setEnabled(True)
-            self.go.setText("Start task")
             self.chat.send.setEnabled(True)
+            self.chat.send.setText("Send")
 
         if shell:
             run_async(self, THREADS.start_shell, tid, lower, payload, title,
@@ -1239,8 +1691,30 @@ class Main(QMainWindow):
     def refresh_hood(self):
         if not self.hood.isChecked():
             return
-        run_async(self, GUEST.snapshot, then=lambda s:
-                  self.hoodview.update_live(s) if isinstance(s, dict) else None)
+
+        def got(snap):
+            if not isinstance(snap, dict):
+                return
+            self.hoodview.update_live(snap)
+            live = [t["tx"] for t in (snap.get("txlive") or [])]
+            if not live:
+                self.hoodview.set_layers(snap, {}, self._agent_of)
+                return
+
+            # One round trip for every open layer's diff. Bounded by the
+            # number of agents (at most five), and only while the hood is
+            # actually open -- this is the panel somebody is staring at, so
+            # it is the one place the extra calls are worth it.
+            def gotdiffs(res):
+                if isinstance(res, Exception):
+                    return
+                self.hoodview.set_layers(snap, res, self._agent_of)
+
+            def fetch(txs):
+                return {str(t): GUEST.session_diff(t) for t in txs}
+            run_async(self, fetch, live[:6], then=gotdiffs)
+
+        run_async(self, GUEST.snapshot, then=got)
 
     # ------------------------------------------------------------ polling
     def _thread(self, tid):
@@ -1260,13 +1734,20 @@ class Main(QMainWindow):
         self.sessions = sessions
         # The strip is live whether or not the hood panel is open, which
         # is the entire point of it.
-        run_async(self, GUEST.snapshot, then=lambda sn:
-                  self.chat.update_live(sn) if isinstance(sn, dict) else None)
+        def livesnap(sn):
+            if not isinstance(sn, dict):
+                return
+            self.chat.update_live(sn)
+            if sn.get("reachable"):
+                self._live_tx = {str(t.get("tx"))
+                                 for t in (sn.get("txlive") or [])}
+        run_async(self, GUEST.snapshot, then=livesnap)
         sig = [(t.get("id"), t.get("turns"), t.get("lines"), t.get("tx"))
                for t in threads]
         if sig != self._last_sig:
             self._last_sig = sig
             self.rebuild_list()
+        self.chat.sync_decisions(sessions)
         self.refresh_chat()
 
     def refresh_chat(self):
@@ -1307,6 +1788,12 @@ class Main(QMainWindow):
                 if self._rendered != tid:
                     return
                 self._since[tid] = n
+                # A swarm names its agents as they finish; the layer
+                # picture is much easier to read with "add-license" on a
+                # card than "transaction 23".
+                for e in evs:
+                    if e.get("type") == "swarm_agent_done" and e.get("tx"):
+                        self._agent_of[str(e["tx"])] = e.get("agent") or ""
                 self.chat.append_events(evs)
             run_async(self, THREADS.events, tid, since, then=got)
 
@@ -1320,10 +1807,14 @@ class Main(QMainWindow):
             self.chat.set_review(tx, s.get("status"), [])
             return
 
-        # More than one open transaction for this thread means a swarm is
-        # waiting, and each agent is decided on its own row.
-        swarm = sum(1 for x in self.sessions
-                    if x.get("status") == "awaiting-decision") > 1
+        # Is THIS conversation a swarm?
+        #
+        # Counting every awaiting-decision session in the system was wrong
+        # in the ordinary case: sessions from older threads linger in
+        # /run/agenttx, so a single-agent task saw "more than one waiting"
+        # and hid its own Keep/Discard bar. The transcript already knows --
+        # a swarm turn emits swarm_result and a single agent does not.
+        swarm = self.chat._is_swarm
 
         def gotdiff(diff):
             if isinstance(diff, Exception):
@@ -1347,6 +1838,14 @@ class Main(QMainWindow):
             # bare "—" made that look like a broken row. There is genuinely
             # nothing pending, so say that.
             status = (s or {}).get("status") or "closed"
+            # A status file saying "awaiting-decision" only means somebody
+            # wrote that line. If the kernel has no such transaction the
+            # session is gone -- killed, reaped by the watchdog, or lost
+            # with a reboot -- and showing "decide" invites a click that
+            # cannot do anything.
+            if status == "awaiting-decision" and self._live_tx is not None \
+                    and str(tx) not in self._live_tx:
+                status = "closed"
             colour, word = STATUS.get(status, ("#8b9aad", status))
             w = QWidget()
             wl = QVBoxLayout(w)
@@ -1359,7 +1858,7 @@ class Main(QMainWindow):
             # and it rendered as "o decision pendin".
             if len(title) > 26:
                 title = title[:25] + "…"
-            lb = lab(title, bold=True)
+            lb = lab(title, bold=True, selectable=False)
             lb.setWordWrap(False)
             top.addWidget(lb)
             top.addStretch(1)
@@ -1368,8 +1867,11 @@ class Main(QMainWindow):
             top.addWidget(pl)
             wl.addLayout(top)
             n = t.get("turns", 0)
-            wl.addWidget(lab(f"{n} turn{'s' if n != 1 else ''}", "Muted"))
-            wl.addWidget(lab(t.get("lower") or "", "Muted"))
+            wl.addWidget(lab(f"{n} turn{'s' if n != 1 else ''}", "Muted",
+                             selectable=False))
+            wl.addWidget(lab(t.get("lower") or "", "Muted", selectable=False))
+            w.setAttribute(
+                Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
             it = QListWidgetItem()
             it.setSizeHint(QSize(0, w.sizeHint().height()))
             self.list.addItem(it)
@@ -1380,11 +1882,14 @@ class Main(QMainWindow):
             if t.get("id") == keep:
                 self.list.setCurrentRow(i)
                 return
-        if self.threads:
+        if self.threads and not self._want_new:
+            # Only auto-open on first load. Never steal a conversation the
+            # person deliberately left.
             self.list.setCurrentRow(0)
 
     def pick(self, row):
         if 0 <= row < len(self.threads):
+            self._want_new = False
             self.selected = self.threads[row].get("id")
             self.refresh_chat()
 

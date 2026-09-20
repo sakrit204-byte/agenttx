@@ -137,3 +137,37 @@ QTabBar::tab:selected { background: #161d27; color: #e6edf3; }
   background: #1d1a14; border: 1px solid #4a3a1f;
   border-left: 3px solid #d29922; border-radius: 10px;
 }
+
+#NewChat {
+  background: #1b2433; color: #e6edf3; border: 1px solid #2c3a4e;
+  border-radius: 8px; padding: 7px 15px; font-size: 12.5px; font-weight: 600;
+}
+#NewChat:hover { background: #22304a; border: 1px solid #3a4d68; }
+#Welcome { background: #0b0f16; }
+#Mode {
+  background: #10161f; color: #9fb0c3; border: 1px solid #222c3a;
+  border-radius: 8px; padding: 6px 10px; font-size: 12px;
+}
+QPushButton:disabled { color: #4b5666; border-color: #1c2531; background: #0e141c; }
+
+/* The layer picture. */
+#LayerBox {
+  background: #101a14; border: 1px solid #23402c;
+  border-radius: 11px;
+}
+#RealBox {
+  background: #141821; border: 1px solid #2a3344;
+  border-radius: 11px;
+}
+#TxCard {
+  background: #121820; border: 1px solid #2a3a52;
+  border-left: 3px solid #58a6ff; border-radius: 10px;
+}
+#TxCard[hover="true"] {
+  background: #17202e; border: 1px solid #58a6ff;
+  border-left: 3px solid #58a6ff;
+}
+#Chip { border-radius: 6px; }
+#DiffView {
+  background: #0a0e14; border: 1px solid #1c2531; border-radius: 8px;
+}
