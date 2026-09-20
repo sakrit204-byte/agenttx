@@ -449,6 +449,41 @@ class HoodView(QWidget):
                   f"  written      {st.get('n_written')}"]
         else:
             L.append("  none open")
+        # --- what the kernel says right now, not what it once logged ---
+        #
+        # These two come from /sys/kernel/debug/agenttx/{transactions,
+        # waitfor}, which are the live table and the live graph. The
+        # earlier version counted dmesg lines, which only ever goes up:
+        # an edge added and released still counted, so the panel would
+        # claim wait-for edges existed long after they were gone.
+        L += ["", "LIVE TRANSACTIONS  (/sys/kernel/debug/agenttx)", "=" * 58]
+        live = snap.get("txlive") or []
+        if live:
+            L.append("  %-6s %-12s %-12s %8s %8s %8s"
+                     % ("tx", "state", "worst", "deferred", "written", "pid"))
+            for t in live[:14]:
+                L.append("  %-6s %-12s %-12s %8s %8s %8s"
+                         % (t["tx"], t["state"], t["worst"],
+                            t["deferred"], t["written"], t["pid"]))
+        else:
+            L.append("  no transaction open")
+
+        L += ["", "WAIT-FOR GRAPH", "=" * 58]
+        wfg = snap.get("wfg") or []
+        if wfg:
+            for e in wfg[:20]:
+                L.append("  tx %s  --waiting on-->  tx %s   (%s, %s ms)"
+                         % (e["waiter"], e["holder"], e["kind"], e["age_ms"]))
+            L.append("")
+            L.append("  A cycle here is a deadlock. The kernel finds it when")
+            L.append("  the edge is added, picks the least-severe victim, and")
+            L.append("  aborts it -- abort IS the preemption primitive.")
+        else:
+            L.append("  no transaction is waiting on another")
+            L.append("")
+            L.append("  This is the normal state with one agent. Run a task")
+            L.append("  with several agents at once to make edges appear.")
+
         L += ["", "COPY-ON-WRITE AREAS", "=" * 58]
         for d in snap.get("txdirs", [])[:14]:
             L.append(f"  tx {d['tx']:<4} {d['upper_entries']:>4} entries   {d['lower']}")

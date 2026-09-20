@@ -40,6 +40,7 @@
 
 #define pr_fmt(fmt) "agenttx: " fmt
 
+#include <linux/math64.h>
 #include <linux/ktime.h>
 #include <linux/list.h>
 #include <linux/module.h>
@@ -494,6 +495,28 @@ unsigned int tx_wait_count(void)
 	n = tx_n_edges;
 	spin_unlock(&tx_edges_lock);
 	return n;
+}
+
+/*
+ * Visit every live edge under the edge lock.
+ *
+ * The lock and the list stay private to this file: a debugfs printer that
+ * took tx_edges_lock itself would be a second lock site for the same data
+ * in a file whose whole job is to be inspected under load, and that is
+ * how a lock-ordering bug gets introduced against a printer. The visitor
+ * runs with the lock held and a spinlock held, so it must not sleep --
+ * seq_printf into a seq_file buffer does not.
+ */
+void tx_wait_for_each(tx_wait_visit_fn fn, void *arg)
+{
+	struct tx_edge *e;
+	u64 now = ktime_get_ns();
+
+	spin_lock(&tx_edges_lock);
+	list_for_each_entry(e, &tx_edges, node)
+		fn(e->waiter, e->holder, wait_name(e->kind),
+		   div_u64(now - e->since_ns, NSEC_PER_MSEC), arg);
+	spin_unlock(&tx_edges_lock);
 }
 
 int tx_waitfor_init(void)

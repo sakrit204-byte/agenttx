@@ -685,6 +685,38 @@ static int cmd_session(int fd, __u32 flags, __u32 timeout_ms,
 			 TX_SESSION_DIR, (unsigned long long)tx);
 		mkdir(dir, 0700);
 
+		/*
+		 * Clear anything left from a PREVIOUS session with this id.
+		 *
+		 * Transaction ids restart at 1 every time the module is
+		 * reloaded, and session directories are named by id, so a
+		 * fresh transaction routinely lands on the directory of a
+		 * dead one. If that directory still held a `decide` file,
+		 * the new transaction read somebody else's answer and
+		 * ended instantly -- observed as a session that reported
+		 * "awaiting decision" and "aborted" in the same breath,
+		 * with no human anywhere near it.
+		 *
+		 * Removed by name rather than rm -rf: this path is built
+		 * from a transaction id, but it is still a path being
+		 * deleted as root, and a loop that unlinks four known
+		 * filenames cannot be talked into deleting anything else.
+		 */
+		{
+			static const char *stale[] = {
+				"decide", "status", "exit", "output",
+				"cmd", "lower", "watch", "done",
+			};
+			size_t i;
+
+			for (i = 0; i < sizeof(stale) / sizeof(*stale); i++) {
+				char p[600];
+
+				snprintf(p, sizeof(p), "%s/%s", dir, stale[i]);
+				unlink(p);
+			}
+		}
+
 		kid = fork();
 		if (kid < 0)
 			_exit(72);

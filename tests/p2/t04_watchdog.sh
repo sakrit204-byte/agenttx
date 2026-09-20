@@ -52,6 +52,21 @@ fi
 # Be the watcher for a moment, then stop -- the closed-window case.
 for _ in 1 2 3; do touch "$dir/watch"; sleep 0.3; done
 
+# Somebody ELSE may be watching. The desktop app touches watch on every
+# session it can see, about once a second, so with the app open this
+# session is legitimately still being watched and must NOT abort -- the
+# watchdog is behaving correctly and the test simply cannot run here.
+# Skipping with the reason beats failing and sending the next person to
+# look for a bug in the watchdog.
+before_mtime=$(stat -c %Y "$dir/watch" 2>/dev/null || echo 0)
+sleep 2.5
+after_mtime=$(stat -c %Y "$dir/watch" 2>/dev/null || echo 0)
+if [[ "$after_mtime" != "$before_mtime" ]]; then
+	echo "another watcher is active (the desktop app?); cannot test abandonment"
+	kill -9 $sess 2>/dev/null
+	exit 77
+fi
+
 waited=0
 while kill -0 $sess 2>/dev/null && (( waited < 200 )); do
 	sleep 0.1; waited=$((waited + 1))

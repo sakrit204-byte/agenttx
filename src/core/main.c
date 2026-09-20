@@ -154,6 +154,10 @@ static int __init agenttx_init(void)
 	 * looking at -- tools/ui/guest.py did exactly that -- got the wrong
 	 * answer for two of the three.
 	 */
+	/* Optional, and last: a debugging view must never be able to fail a
+	   load that would otherwise have worked. */
+	tx_debugfs_init();
+
 	pr_info("loaded, abi %u, fs=%s eff=%s classify=%s, %s\n",
 		AGENTTX_ABI_VERSION,
 		IS_ENABLED(CONFIG_AGENTTX_STUB_FS)       ? "stub" : "real",
@@ -173,6 +177,14 @@ err_ctx:
 
 static void __exit agenttx_exit(void)
 {
+	/*
+	 * Debugging view first: it holds no transaction state, and leaving
+	 * it behind would keep /sys/kernel/debug/agenttx around after the
+	 * module is gone -- so the next insmod finds the directory already
+	 * there and the files point at nothing.
+	 */
+	tx_debugfs_exit();
+
 	/*
 	 * Reverse order of init, and the ordering is load-bearing rather
 	 * than stylistic:

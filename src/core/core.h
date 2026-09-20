@@ -175,4 +175,15 @@ int  tx_waitfor_init(void);
 void tx_waitfor_exit(void);
 unsigned int tx_wait_count(void);
 
+/* Visit every live edge, under the edge lock.  Must not sleep. */
+typedef void (*tx_wait_visit_fn)(tx_id_t waiter, tx_id_t holder,
+				 const char *kind, u64 age_ms, void *arg);
+void tx_wait_for_each(tx_wait_visit_fn fn, void *arg);
+
+/* ---------------------------------------------------------------- */
+/* wfdebug.c --- optional read-only debugfs view of live state       */
+/* ---------------------------------------------------------------- */
+void tx_debugfs_init(void);
+void tx_debugfs_exit(void);
+
 #endif /* _AGENTTX_CORE_H */

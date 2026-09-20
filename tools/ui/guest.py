@@ -147,10 +147,24 @@ echo "---LIVE---"
 # The handful of numbers the always-on strip shows while agents work.
 # Counted here rather than in four separate ssh calls: this script is
 # already one round trip and the strip refreshes about once a second.
-printf 'opentx='; ls -1d /run/agenttx/session-* 2>/dev/null | wc -l
+# Read LIVE state out of debugfs, not out of dmesg.
+#
+# Counting log lines reports history, not state: an edge that was added
+# and released still counts, so the number only ever goes up, and a panel
+# claiming "3 wait-for edges" when there are none is worse than one that
+# says nothing. /sys/kernel/debug/agenttx/{transactions,waitfor} are the
+# current contents of the table and the graph. Deadlocks stay a dmesg
+# count because that one genuinely IS cumulative -- a broken cycle is an
+# event that happened, not a thing that is.
+DBG=/sys/kernel/debug/agenttx
+printf 'opentx='; { tail -n +2 "$DBG/transactions" 2>/dev/null || true; } | grep -c . || true
 printf 'upperfiles='; find /var/lib/agenttx -mindepth 3 -path '*/upper/*' -type f 2>/dev/null | wc -l
-printf 'wfg='; dmesg 2>/dev/null | grep -c 'agenttx/wf: edge' || echo 0
-printf 'deadlocks='; dmesg 2>/dev/null | grep -c 'agenttx/wf:.*cycle' || echo 0
+printf 'wfg='; { tail -n +2 "$DBG/waitfor" 2>/dev/null || true; } | grep -c . || true
+printf 'deadlocks='; dmesg 2>/dev/null | grep -c 'aborting as a deadlock victim' || echo 0
+echo "---WFG---"
+tail -n +2 "$DBG/waitfor" 2>/dev/null | head -40 || true
+echo "---TXLIVE---"
+tail -n +2 "$DBG/transactions" 2>/dev/null | head -40 || true
 printf 'brain='; curl -s --max-time 2 http://10.0.2.2:11434/api/tags 2>/dev/null \
   | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1 || true
 echo
@@ -254,6 +268,19 @@ echo "---END---"
                     pass
             elif k == "brain":
                 out["brain"] = v or "no local model"
+        out["wfg"] = []
+        for l in sec.get("WFG", []):
+            f = l.split()
+            if len(f) >= 4:
+                out["wfg"].append({"waiter": f[0], "holder": f[1],
+                                   "kind": f[2], "age_ms": f[3]})
+        out["txlive"] = []
+        for l in sec.get("TXLIVE", []):
+            f = l.split()
+            if len(f) >= 6:
+                out["txlive"].append({"tx": f[0], "state": f[1],
+                                      "worst": f[2], "deferred": f[3],
+                                      "written": f[4], "pid": f[5]})
         return out
 
     # --- deploy: binaries must run from LOCAL disk, not the 9p share ----
