@@ -63,6 +63,7 @@ STATUS = {
     "committed":          ("#3fb950", "kept"),
     "aborted":            ("#8b9aad", "discarded"),
     "failed":             ("#f85149", "failed"),
+    "closed":             ("#6b7a8d", "no decision pending"),
 }
 
 
@@ -1117,7 +1118,15 @@ class Main(QMainWindow):
         for t in self.threads:
             tx = t.get("tx")
             s = next((x for x in self.sessions if x.get("tx") == tx), None)
-            status = (s or {}).get("status") or "—"
+            # No live session for this thread's last transaction.
+            #
+            # Usually that just means the decision was made and txctl exited.
+            # It also happens after a guest reboot: sessions live in
+            # /run/agenttx, which is tmpfs, while threads live on disk -- so
+            # every past conversation comes back with nothing to decide. A
+            # bare "—" made that look like a broken row. There is genuinely
+            # nothing pending, so say that.
+            status = (s or {}).get("status") or "closed"
             colour, word = STATUS.get(status, ("#8b9aad", status))
             w = QWidget()
             wl = QVBoxLayout(w)

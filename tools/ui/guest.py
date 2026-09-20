@@ -296,7 +296,6 @@ echo "deployed=$changed"
         self.deploy()
         script = f"""
 mkdir -p {shlex.quote(lower)} /run/agenttx
-chown {shlex.quote(as_user)} {shlex.quote(lower)} 2>/dev/null || true
 cd {shlex.quote(lower)}
 setsid /usr/local/bin/txctl session --lower {shlex.quote(lower)} --as {shlex.quote(as_user)} -- {cmd} >/run/agenttx/last-start.log 2>&1 &
 sleep 2
@@ -575,8 +574,6 @@ TD=%(td)s
 mkdir -p "$TD" /run/agenttx
 chmod 0755 "$(dirname "$TD")" 2>/dev/null || true
 LOWER=%(lower)s
-mkdir -p "$LOWER"
-chown %(user)s "$LOWER" 2>/dev/null || true
 
 # First turn sets up the thread; later turns only bump the counter.
 if [ ! -f "$TD/created" ]; then
@@ -587,6 +584,58 @@ if [ ! -f "$TD/created" ]; then
   echo 0 > "$TD/turns"
   : > "$TD/events.jsonl"
 fi
+
+# --- who the agent runs as, and whose folder this is ------------------
+#
+# This used to be one line: chown the protected folder to `agent`. Two
+# things were wrong with that.
+#
+# 1. It is a real, permanent change to the user's files, made BEFORE any
+#    decision. The whole promise of this system is that nothing happens
+#    until you press Keep, and quietly taking ownership of somebody's
+#    directory is something happening.
+# 2. It did not even work. chown on the DIRECTORY lets the agent create
+#    and delete entries, but the files inside keep their old owner, so
+#    editing an existing root-owned file failed with "Permission denied"
+#    -- while creating and deleting succeeded. A harness whose main job is
+#    editing existing files silently could not edit existing files.
+#
+# So: run the agent as whoever already owns the folder, which needs no
+# chown and gives exactly the access that user already had. Only claim
+# ownership of a directory we created ourselves. If the folder belongs to
+# root we cannot run there (Claude Code refuses
+# --dangerously-skip-permissions as root, deliberately), so we fall back to
+# the sandbox user and say plainly what will not work.
+if [ -d "$LOWER" ]; then PRE=1; else PRE=0; mkdir -p "$LOWER"; fi
+OWNER=$(stat -c %%U "$LOWER" 2>/dev/null || echo root)
+if [ "$OWNER" != root ] && id -u "$OWNER" >/dev/null 2>&1; then
+  RUNAS=$OWNER
+else
+  RUNAS=%(user)s
+  [ "$PRE" = 0 ] && chown "$RUNAS" "$LOWER" 2>/dev/null || true
+fi
+
+# Warn about what this user cannot touch, in the transcript, before the
+# agent starts -- not as a "Permission denied" three tool calls in.
+# find's -writable tests the CURRENT user, so it has to run as RUNAS.
+BLOCKED=$(su "$RUNAS" -s /bin/sh -c \
+  "find \"$LOWER\" -maxdepth 3 -type f ! -writable 2>/dev/null | head -12" \
+  2>/dev/null)
+if [ -n "$BLOCKED" ]; then
+  python3 - "$TD/events.jsonl" "$RUNAS" <<'TXWARN_EOF' "$BLOCKED"
+import json, sys, time
+ev, runas, blocked = sys.argv[1], sys.argv[2], sys.argv[3]
+files = [b for b in blocked.splitlines() if b.strip()]
+msg = ("Heads up: the agent runs as '%%s', and these files are not writable "
+       "by it, so it can read them but any edit will fail:\n  %%s\n\n"
+       "Fix with:  sudo chown -R %%s <folder>" %%
+       (runas, "\n  ".join(files[:12]), runas))
+with open(ev, "a") as f:
+    f.write(json.dumps({"type": "tx_notice", "at": time.time(),
+                        "text": msg}) + "\n")
+TXWARN_EOF
+fi
+
 TURN=$(( $(cat "$TD/turns" 2>/dev/null || echo 0) + 1 ))
 echo "$TURN" > "$TD/turns"
 cat > "$TD/turn-$TURN.prompt" <<'TXPROMPT_EOF'
@@ -595,10 +644,10 @@ TXPROMPT_EOF
 SID=$(cat "$TD/session")
 
 # The agent must be able to write its own transcript.
-chown -R %(user)s "$TD" 2>/dev/null || true
+chown -R "$RUNAS" "$TD" 2>/dev/null || true
 
 cd "$LOWER"
-setsid /usr/local/bin/txctl session --lower "$LOWER" --as %(user)s -- \
+setsid /usr/local/bin/txctl session --lower "$LOWER" --as "$RUNAS" -- \
     /usr/local/bin/tx-agent.py "$TD" "$TURN" "$SID" \
     > /run/agenttx/last-start.log 2>&1 &
 sleep 2
@@ -632,8 +681,6 @@ TD=%(td)s
 mkdir -p "$TD" /run/agenttx
 chmod 0755 "$(dirname "$TD")" 2>/dev/null || true
 LOWER=%(lower)s
-mkdir -p "$LOWER"
-chown %(user)s "$LOWER" 2>/dev/null || true
 if [ ! -f "$TD/created" ]; then
   date +%%s > "$TD/created"
   printf '%%s' %(title)s > "$TD/title"
@@ -642,14 +689,66 @@ if [ ! -f "$TD/created" ]; then
   echo 0 > "$TD/turns"
   : > "$TD/events.jsonl"
 fi
+
+# --- who the agent runs as, and whose folder this is ------------------
+#
+# This used to be one line: chown the protected folder to `agent`. Two
+# things were wrong with that.
+#
+# 1. It is a real, permanent change to the user's files, made BEFORE any
+#    decision. The whole promise of this system is that nothing happens
+#    until you press Keep, and quietly taking ownership of somebody's
+#    directory is something happening.
+# 2. It did not even work. chown on the DIRECTORY lets the agent create
+#    and delete entries, but the files inside keep their old owner, so
+#    editing an existing root-owned file failed with "Permission denied"
+#    -- while creating and deleting succeeded. A harness whose main job is
+#    editing existing files silently could not edit existing files.
+#
+# So: run the agent as whoever already owns the folder, which needs no
+# chown and gives exactly the access that user already had. Only claim
+# ownership of a directory we created ourselves. If the folder belongs to
+# root we cannot run there (Claude Code refuses
+# --dangerously-skip-permissions as root, deliberately), so we fall back to
+# the sandbox user and say plainly what will not work.
+if [ -d "$LOWER" ]; then PRE=1; else PRE=0; mkdir -p "$LOWER"; fi
+OWNER=$(stat -c %%U "$LOWER" 2>/dev/null || echo root)
+if [ "$OWNER" != root ] && id -u "$OWNER" >/dev/null 2>&1; then
+  RUNAS=$OWNER
+else
+  RUNAS=%(user)s
+  [ "$PRE" = 0 ] && chown "$RUNAS" "$LOWER" 2>/dev/null || true
+fi
+
+# Warn about what this user cannot touch, in the transcript, before the
+# agent starts -- not as a "Permission denied" three tool calls in.
+# find's -writable tests the CURRENT user, so it has to run as RUNAS.
+BLOCKED=$(su "$RUNAS" -s /bin/sh -c \
+  "find \"$LOWER\" -maxdepth 3 -type f ! -writable 2>/dev/null | head -12" \
+  2>/dev/null)
+if [ -n "$BLOCKED" ]; then
+  python3 - "$TD/events.jsonl" "$RUNAS" <<'TXWARN_EOF' "$BLOCKED"
+import json, sys, time
+ev, runas, blocked = sys.argv[1], sys.argv[2], sys.argv[3]
+files = [b for b in blocked.splitlines() if b.strip()]
+msg = ("Heads up: the agent runs as '%%s', and these files are not writable "
+       "by it, so it can read them but any edit will fail:\n  %%s\n\n"
+       "Fix with:  sudo chown -R %%s <folder>" %%
+       (runas, "\n  ".join(files[:12]), runas))
+with open(ev, "a") as f:
+    f.write(json.dumps({"type": "tx_notice", "at": time.time(),
+                        "text": msg}) + "\n")
+TXWARN_EOF
+fi
+
 TURN=$(( $(cat "$TD/turns" 2>/dev/null || echo 0) + 1 ))
 echo "$TURN" > "$TD/turns"
 cat > "$TD/turn-$TURN.cmd" <<'TXCMD_EOF'
 %(cmd)s
 TXCMD_EOF
-chown -R %(user)s "$TD" 2>/dev/null || true
+chown -R "$RUNAS" "$TD" 2>/dev/null || true
 cd "$LOWER"
-setsid /usr/local/bin/txctl session --lower "$LOWER" --as %(user)s -- \
+setsid /usr/local/bin/txctl session --lower "$LOWER" --as "$RUNAS" -- \
     /usr/local/bin/tx-shell.sh "$TD" "$TURN" \
     > /run/agenttx/last-start.log 2>&1 &
 sleep 2
