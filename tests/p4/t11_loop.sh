@@ -39,7 +39,16 @@ start_srv() {   # start_srv <script.json>
 run_loop() {    # run_loop <turn> <prompt>
 	: > "$TD/events.jsonl"
 	printf '%s' "$2" > "$TD/turn-$1.prompt"
+	# Pin the model name.
+	#
+	# The fixture's /api/tags reports one name, and Brain.available()
+	# refuses to run if the configured model is not among them. Leaving
+	# this to the default meant that changing the default model in
+	# brain.py silently broke every assertion in this file -- which it
+	# did: the loop exited 69 "model not ready" and the test reported
+	# nine missing events rather than one wrong model name.
 	( cd "$WORK" && AGENTTX_OLLAMA="http://127.0.0.1:$PORT" \
+	  AGENTTX_MODEL="qwen2.5-coder:7b" \
 	  AGENTTX_MAX_STEPS="${MAXSTEPS:-24}" \
 	  python3 "$REPO/tools/agent/loop.py" "$TD" "$1" >/dev/null 2>&1 )
 }
