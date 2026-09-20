@@ -1135,7 +1135,7 @@ class ChatView(QWidget):
             note.setText("applying…")
         self.decided.emit(tx, what)
 
-    def sync_decisions(self, sessions):
+    def sync_decisions(self, sessions, live_tx=None):
         """
         Keep the per-agent buttons honest about what still exists.
 
@@ -1151,6 +1151,14 @@ class ChatView(QWidget):
                 for x in (sessions or [])}
         for tx, (d, k, note) in self._decide_rows.items():
             st = live.get(tx)
+            # A status file is only a note somebody left. If it still says
+            # "awaiting-decision" but the kernel has no such transaction,
+            # the session died before it could finish writing -- killed,
+            # or reaped by the watchdog mid-commit -- and the buttons must
+            # not pretend otherwise.
+            if st == "awaiting-decision" and live_tx is not None \
+                    and tx not in live_tx:
+                st = "gone"
             if st == "awaiting-decision":
                 if not note.text() == "applying…":
                     d.setEnabled(True)
@@ -1747,7 +1755,7 @@ class Main(QMainWindow):
         if sig != self._last_sig:
             self._last_sig = sig
             self.rebuild_list()
-        self.chat.sync_decisions(sessions)
+        self.chat.sync_decisions(sessions, self._live_tx)
         self.refresh_chat()
 
     def refresh_chat(self):

@@ -567,8 +567,19 @@ static int sess_write(const char *dir, const char *name, const char *fmt, ...)
 
 	snprintf(path, sizeof(path), "%s/%s", dir, name);
 	f = fopen(path, "w");
-	if (!f)
+	if (!f) {
+		/*
+		 * Say so. A silent failure here is how the session file and
+		 * the kernel came to disagree: a transaction committed, the
+		 * status file still said "awaiting-decision", and every
+		 * reader of that file -- the task list, the decision
+		 * buttons -- reported work that had been KEPT as work that
+		 * had expired.
+		 */
+		fprintf(stderr, "txctl: cannot write %s: %s\n",
+			path, strerror(errno));
 		return -1;
+	}
 	va_start(ap, fmt);
 	vfprintf(f, fmt, ap);
 	va_end(ap);
