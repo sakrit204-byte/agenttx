@@ -42,10 +42,35 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
-        self.rfile.read(n)
-        i = min(CALLS["n"], len(SCRIPT) - 1)
-        CALLS["n"] += 1
-        self._send({"message": SCRIPT[i], "done": True,
+        body = self.rfile.read(n).decode("utf-8", "replace")
+
+        # Two modes.
+        #
+        # Sequential (the default) walks SCRIPT in order, which is what the
+        # single-loop tests want.
+        #
+        # Content-aware is for the SWARM test, where several agents share
+        # one fixture and a global counter would hand each of them a
+        # different step of the script -- agent 1 gets the write, agent 2
+        # gets the summary, and the conflict the test exists to prove never
+        # happens. Deciding from the request instead makes every agent
+        # behave identically no matter what order they arrive in.
+        if SCRIPT and isinstance(SCRIPT[0], dict) and SCRIPT[0].get("_mode") == "content":
+            by = {e.get("_when"): e for e in SCRIPT if e.get("_when")}
+            if "Split this job" in body:
+                msg = by.get("plan")
+            elif '"role": "tool"' in body or '"role":"tool"' in body:
+                msg = by.get("after_tool")
+            else:
+                msg = by.get("first")
+            msg = {k: v for k, v in (msg or {}).items()
+                   if not k.startswith("_")}
+        else:
+            i = min(CALLS["n"], len(SCRIPT) - 1)
+            CALLS["n"] += 1
+            msg = SCRIPT[i]
+
+        self._send({"message": msg, "done": True,
                     "eval_count": 20, "prompt_eval_count": 100})
 
 

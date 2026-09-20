@@ -116,6 +116,10 @@ run_test 1 tests/p2/t04_watchdog.sh
 # Tier 1, not tier 0: the agent harness needs a real transaction underneath.
 # It uses tests/fixtures/fake-claude, so it needs no login and spends nothing.
 run_test 1 tests/p4/t09_agentloop.sh
+# Tier 1: N agents, N transactions, one folder -- the case the whole
+# transaction machinery exists for. Uses the scripted fixture, so it needs
+# no model and spends nothing.
+run_test 1 tests/p4/t12_swarm.sh
 
 # --- tier 2: BPF LSM attached ------------------------------------------
 echo

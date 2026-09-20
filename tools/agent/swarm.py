@@ -37,8 +37,10 @@ of them overlap. Saying otherwise would overstate what is built.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
+import pwd
 import re
 import subprocess
 import sys
@@ -65,6 +67,20 @@ Answer with ONLY a JSON array of {n} objects, nothing else:
 
 Each part must name the specific files it will touch. Parts that edit the
 same file are allowed but say so."""
+
+
+def handover(path: str, user: str, create: bool = False) -> None:
+    """Make `path` writable by the user the agents run as."""
+    try:
+        if create and not os.path.exists(path):
+            open(path, "a").close()
+        info = pwd.getpwnam(user)
+        os.chown(path, info.pw_uid, info.pw_gid)
+    except (OSError, KeyError):
+        # Not fatal on its own -- if we are not root, or the user does not
+        # exist, the agents may still be able to write. Failing the whole
+        # swarm here would turn a permissions warning into an outage.
+        pass
 
 
 def emit(events: str, rec: dict) -> None:
@@ -126,9 +142,47 @@ def launch(thread_dir: str, turn: int, lower: str, runas: str,
                             start_new_session=True)
 
 
-def tx_of(proc_out: str) -> str:
-    m = re.search(r"tx=(\d+) session started", proc_out)
-    return m.group(1) if m else ""
+def read_small(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(200).strip()
+    except OSError:
+        return ""
+
+
+def session_of(agent: str, ignore: set) -> str:
+    """
+    The session directory belonging to `agent`, or "".
+
+    Matched on the recorded command line, which carries --agent NAME.
+    Session directories are named by transaction id, and ids restart at 1
+    whenever the module reloads, so picking "the newest directory" is
+    wrong in exactly the situation that matters -- several agents starting
+    at once -- and picking by glob order is worse still, because the glob
+    sorts lexically and session-9 comes after session-10.
+    """
+    needle = "--agent %s" % agent
+    for d in glob.glob(os.path.join(SESSION_DIR, "session-*")):
+        # Skip directories that already existed before we launched.
+        #
+        # Session directories are named by transaction id, ids restart at
+        # 1 on every module reload, and a finished session leaves its
+        # directory behind -- so a previous run's session-5 still has
+        # "--agent alpha" in its cmd file and matches perfectly. The first
+        # version picked those up: both agents were reported finished
+        # 0.4s after launch, having produced no events at all, because it
+        # was reading a dead run's status.
+        if d in ignore:
+            continue
+        cmd = read_small(os.path.join(d, "cmd"))
+        if needle in cmd and cmd.endswith(agent):
+            return d
+        if needle in cmd:
+            # --agent NAME may be followed by --model, so an exact tail
+            # match is not guaranteed; a token match is.
+            if agent in cmd.split():
+                return d
+    return ""
 
 
 def write_set(tx: str) -> set[str]:
@@ -157,6 +211,21 @@ def main() -> int:
     with open(os.path.join(td, "turn-%d.prompt" % a.turn), encoding="utf-8") as f:
         task = f.read().strip()
 
+    # The transcript is shared, and its writers do not share a uid.
+    #
+    # This orchestrator runs as root; every agent it starts runs as
+    # --runas. Whoever creates events.jsonl first owns it, and root
+    # creating it makes it unwritable by the agents, which then die with
+    # PermissionError before emitting a single event. Seen exactly that
+    # way: agents launched, transcript stayed at the orchestrator's five
+    # lines, and the swarm reported two agents that had done nothing.
+    #
+    # Any chown in the launcher happens BEFORE this file exists, so it has
+    # to be done here, by the process that creates it.
+    handover(events, a.runas, create=True)
+    for name in ("turn-%d.prompt" % a.turn,):
+        handover(os.path.join(td, name), a.runas)
+
     brain = Brain(model=a.model) if a.model else Brain()
     ok, detail = brain.available()
     if not ok:
@@ -179,6 +248,10 @@ def main() -> int:
     emit(events, {"type": "swarm_plan", "turn": a.turn,
                   "parts": parts})
 
+    # Every session directory that exists right now belongs to somebody
+    # else, or to a run that is already over. See session_of().
+    pre_existing = set(glob.glob(os.path.join(SESSION_DIR, "session-*")))
+
     # Each agent gets its own subtask file and its own transaction.
     procs = {}
     for p in parts:
@@ -193,20 +266,37 @@ def main() -> int:
         # simultaneous registration is a race we do not need to take here.
         time.sleep(0.4)
 
-    # Wait for every agent to reach its decision point.
+    # Wait for every agent to reach its DECISION POINT, not its exit.
+    #
+    # The first version waited on p.poll(), which never returns: `txctl
+    # session` is supposed to hold its transaction open until a human
+    # decides, for up to an hour. So the orchestrator sat there until its
+    # own timeout while every agent had long since finished working. The
+    # test caught this as a 420s timeout.
+    #
+    # The session is found by its cmd file rather than by reading the
+    # child's stdout, because reading stdout to completion is the same
+    # blocking mistake in a different shape. txctl records the command
+    # line it was started with, and that line carries --agent NAME.
     txs = {}
     deadline = time.time() + 1800
-    while procs and time.time() < deadline:
-        for name in list(procs):
-            p = procs[name]
-            if p.poll() is None:
+    pending = set(procs)
+    while pending and time.time() < deadline:
+        for name in sorted(pending):
+            d = session_of(name, pre_existing)
+            if not d:
                 continue
-            out = p.stdout.read() if p.stdout else ""
-            txs[name] = tx_of(out)
-            emit(events, {"type": "swarm_agent_done", "turn": a.turn,
-                          "agent": name, "tx": txs[name]})
-            del procs[name]
+            st = read_small(os.path.join(d, "status"))
+            if st in ("awaiting-decision", "committed", "aborted", "failed"):
+                txs[name] = os.path.basename(d).split("session-")[-1]
+                emit(events, {"type": "swarm_agent_done", "turn": a.turn,
+                              "agent": name, "tx": txs[name], "status": st})
+                pending.discard(name)
         time.sleep(0.5)
+
+    for name in sorted(pending):
+        emit(events, {"type": "tx_notice", "turn": a.turn,
+                      "text": "Agent %s did not finish in time." % name})
 
     # --- the point of the whole exercise ------------------------------
     #
