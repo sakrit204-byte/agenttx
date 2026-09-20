@@ -110,6 +110,9 @@ run_test 1 tests/p1/t05_commit.sh
 run_test 1 tests/p1/t06_kill.sh
 run_test 1 tests/p1/t08_kfunc.sh
 run_test 1 tests/p1/t11_waitfor.sh
+# Three transactions, three resources, taken in different orders: the one
+# cycle this system can actually suffer (docs/deadlock.md 2.3).
+run_test 1 tests/p1/t12_claim_deadlock.sh
 run_test 1 tests/p2/t02_abort.sh
 run_test 1 tests/p2/t03_commit.sh
 run_test 1 tests/p2/t04_watchdog.sh

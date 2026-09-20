@@ -371,7 +371,14 @@ def main() -> int:
             fn = c.get("function") or {}
             name = fn.get("name") or "?"
             args = fn.get("arguments")
-            tid = "c%d_%d" % (steps, i)
+            # The agent name is IN the id.
+            #
+            # Every agent numbers its calls from zero, so in a swarm three
+            # of them emit "c0_0" and anything keyed on that id -- the
+            # chat's tool cards, any transcript reader -- attaches one
+            # agent's result to another's call. It read as drain-low
+            # claiming `queue` three times and getting `cache` back.
+            tid = "%s_c%d_%d" % (a.agent or "x", steps, i)
             shown = args if isinstance(args, dict) else {"raw": str(args)[:300]}
             t.tool_use(tid, name, shown)
 

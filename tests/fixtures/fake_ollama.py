@@ -15,6 +15,7 @@ SCRIPT.json is a list of assistant messages, returned in order; the last
 one repeats if the loop asks for more.
 """
 import json
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -36,7 +37,20 @@ class H(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path.startswith("/api/tags"):
-            self._send({"models": [{"name": "qwen2.5-coder:7b"}]})
+            # Report every model any test might be configured to use, plus
+            # whatever AGENTTX_MODEL says.
+            #
+            # Brain.available() refuses to run when the configured model
+            # is not in this list, so a fixture that names ONE model
+            # silently breaks every test the moment somebody changes the
+            # default in brain.py. That happened twice: the loop exited 69
+            # "model not ready" before doing anything, and the suite
+            # reported a pile of missing events rather than one wrong name.
+            names = ["qwen2.5:7b", "qwen2.5-coder:7b", "llama3.1:8b"]
+            want = os.environ.get("AGENTTX_MODEL", "").strip()
+            if want and want not in names:
+                names.insert(0, want)
+            self._send({"models": [{"name": n} for n in names]})
         else:
             self.send_response(404); self.end_headers()
 

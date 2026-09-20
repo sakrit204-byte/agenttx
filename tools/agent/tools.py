@@ -130,6 +130,149 @@ def edit_file(root: str, path: str, old: str, new: str) -> str:
     return "edited %s" % path
 
 
+# --- exclusive claims, and the deadlock they make possible -------------
+#
+# Everything above this line is deadlock-free by construction: each agent
+# works in a private copy-on-write layer, never waits for another's data,
+# and conflicts are settled at commit (docs/deadlock.md §2.2). That is a
+# designed property, and it is why no amount of file editing by any number
+# of agents has ever produced a wait-for edge.
+#
+# But not everything can be done optimistically. An irrevocable effect --
+# a deploy slot, an outbound send, a migration against a live database --
+# cannot be performed speculatively by two agents and reconciled
+# afterwards, because there is nothing to reconcile. Those need EXCLUSIVE
+# access, which means a transaction that waits, which means a wait-for
+# graph, which means cycles. docs/deadlock.md §2.3 calls this the deadlock
+# AgentTx can actually suffer, and it is a direct consequence of the
+# mechanism's own design rather than a bug in it.
+#
+# `claim` is that: a named resource an agent must hold exclusively. The
+# agent blocks; the block is declared to the kernel as a wait-for edge;
+# the kernel runs cycle detection on insert and aborts a victim.
+
+# NOT under /run/agenttx.
+#
+# That directory is 0700 root -- it holds the session state that decides
+# whether a transaction commits -- so the agent cannot traverse into it,
+# and a claims directory inside it was unreachable no matter what mode it
+# had. It was mode 1777 and still invisible, because traversal needs
+# execute on every component of the path.
+#
+# Same answer as the thread transcripts: give it its own root rather than
+# relaxing a directory that is strict on purpose.
+CLAIM_DIR = "/run/agenttx-claims"
+
+
+def _claim_path(resource: str) -> str:
+    safe = "".join(c for c in resource if c.isalnum() or c in "-_.")[:64]
+    if not safe:
+        raise ToolError("a resource needs a name")
+    return os.path.join(CLAIM_DIR, safe)
+
+
+def _first_claim_barrier() -> None:
+    """
+    Hold after the FIRST claim until every agent has one.
+
+    This is demo scaffolding and worth naming as such. A three-way
+    deadlock needs all three agents holding one resource before any of
+    them asks for a second; if one agent gets both before the others have
+    started, there is no cycle and nothing to detect. Without this the
+    deadlock is a race that usually fires -- with it, it always does.
+
+    The deadlock is equally real either way. This fixes the interleaving,
+    not the mechanism. Off unless AGENTTX_CLAIM_BARRIER is set, which the
+    orchestrator only sets when it is running more than one agent.
+    """
+    import time as _t
+
+    try:
+        n = int(os.environ.get("AGENTTX_CLAIM_BARRIER", "0"))
+    except ValueError:
+        n = 0
+    if n < 2:
+        return
+    deadline = _t.time() + 30
+    while _t.time() < deadline:
+        try:
+            held = sum(1 for f in os.listdir(CLAIM_DIR) if ".want." not in f)
+        except OSError:
+            return
+        if held >= n:
+            return
+        _t.sleep(0.2)
+
+
+def claim(root: str, resource: str, timeout: float = 120.0) -> str:
+    """
+    Take exclusive hold of a named resource, waiting if someone has it.
+
+    Blocking is the point. The `.want` file is how a blocked agent tells
+    the orchestrator who it is waiting for: the orchestrator runs as root,
+    holds /dev/agenttx, and turns that into a real TX_IOC_WAIT edge. The
+    agent cannot do it itself -- /dev/agenttx is root-only, deliberately,
+    because anything that can open it can commit and abort transactions
+    that are not its own.
+    """
+    import time as _t
+
+    me = os.environ.get("AGENTTX_TX_ID", "").strip()
+    if not me:
+        raise ToolError("not inside a transaction, so nothing can be claimed")
+    # NOT created here. /run/agenttx is root-only and the agent is not
+    # root; the orchestrator makes this directory before starting anyone.
+    # Trying and failing produced a PermissionError that read like a bug
+    # in the claim itself.
+    if not os.path.isdir(CLAIM_DIR):
+        raise ToolError(
+            "there is no shared-resource registry in this sandbox, so "
+            "nothing needs claiming here. Carry on without it.")
+    path = _claim_path(resource)
+    want = "%s.want.%s" % (path, me)
+    deadline = _t.time() + timeout
+
+    while True:
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(fd, me.encode())
+            os.close(fd)
+            try:
+                os.unlink(want)
+            except OSError:
+                pass
+            _first_claim_barrier()
+            return "claimed %s (exclusive, until this transaction ends)" % resource
+        except FileExistsError:
+            try:
+                with open(path) as f:
+                    holder = f.read().strip()
+            except OSError:
+                continue                      # released under us; retry
+            if holder == me:
+                return "%s is already yours" % resource
+
+            # Tell the orchestrator who is blocking us. It declares the
+            # edge; if that closes a cycle the kernel aborts one of us and
+            # this process simply dies mid-wait, which is the correct
+            # outcome and needs no handling here.
+            try:
+                with open(want, "w") as f:
+                    f.write(holder)
+            except OSError:
+                pass
+
+            if _t.time() > deadline:
+                try:
+                    os.unlink(want)
+                except OSError:
+                    pass
+                raise ToolError(
+                    "waited %ds for %s, which transaction %s still holds. "
+                    "Give up on it and say so." % (timeout, resource, holder))
+            _t.sleep(0.25)
+
+
 def run(root: str, command: str) -> str:
     p = subprocess.run(command, shell=True, cwd=root, capture_output=True,
                        text=True, timeout=120)
@@ -145,6 +288,7 @@ DISPATCH = {
     "write_file": lambda root, a: write_file(root, a["path"], a.get("content", "")),
     "edit_file": lambda root, a: edit_file(root, a["path"], a["old"], a["new"]),
     "run": lambda root, a: run(root, a["command"]),
+    "claim": lambda root, a: claim(root, a["resource"]),
 }
 
 # --- the schema the model sees ----------------------------------------
@@ -182,6 +326,15 @@ SCHEMA = [
             "old": {"type": "string", "description": "Exact text to replace, copied from the file."},
             "new": {"type": "string", "description": "Replacement text."}},
             "required": ["path", "old", "new"]}}},
+    {"type": "function", "function": {
+        "name": "claim",
+        "description": ("Take exclusive hold of a shared resource before "
+                        "using it. Waits if another agent holds it. Use "
+                        "this for anything that cannot be done twice."),
+        "parameters": {"type": "object", "properties": {
+            "resource": {"type": "string",
+                         "description": "The resource name, e.g. 'database'."}},
+            "required": ["resource"]}}},
     {"type": "function", "function": {
         "name": "run",
         "description": "Run a shell command in the working folder.",

@@ -131,15 +131,21 @@ def decompose(brain: Brain, task: str, listing: str, n: int) -> list[dict]:
 
 
 def launch(thread_dir: str, turn: int, lower: str, runas: str,
-           agent: str, model: str | None) -> subprocess.Popen:
+           agent: str, model: str | None,
+           n_agents: int = 1) -> subprocess.Popen:
     argv = [TXCTL, "session", "--lower", lower, "--as", runas, "--",
             "/usr/bin/env", "python3", LOOP, thread_dir, str(turn),
             "--agent", agent]
     if model:
         argv += ["--model", model]
+    env = dict(os.environ)
+    if n_agents > 1:
+        # Makes a three-way claim deadlock deterministic instead of
+        # merely likely. See _first_claim_barrier() in tools.py.
+        env["AGENTTX_CLAIM_BARRIER"] = str(n_agents)
     return subprocess.Popen(argv, cwd=lower, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True)
+                            start_new_session=True, env=env)
 
 
 def read_small(path: str) -> str:
@@ -193,6 +199,117 @@ def write_set(tx: str) -> set[str]:
         for f in files:
             full = os.path.join(dirpath, f)
             out.add(os.path.relpath(full, upper))
+    return out
+
+
+CLAIM_DIR = "/run/agenttx-claims"   # see tools.py: NOT inside the 0700 root
+
+
+def declare_wait(waiter: str, holder: str, kind: str = "data") -> bool:
+    """
+    Register waiter -> holder in the kernel's wait-for graph.
+
+    Returns False if the kernel refused, which is the interesting case:
+    TX_IOC_WAIT runs cycle detection ON INSERT, so a refusal here means
+    this edge would close a cycle. The kernel has already chosen a victim
+    and scheduled its abort by the time we see the error.
+    """
+    r = subprocess.run([TXCTL, "wait", "--tx", str(waiter),
+                        "--holder", str(holder), "--kind", kind],
+                       capture_output=True, text=True, timeout=20)
+    # EXIT CODE IS NOT THE ANSWER.
+    #
+    # Registering an edge that closes a cycle is a SUCCESS as far as
+    # txctl is concerned: the edge went in, the kernel detected the
+    # cycle, chose a victim and aborted it, all as designed -- so it
+    # exits 0 and says "deadlock detected and broken". Reading only the
+    # exit code meant the one event worth reporting never reached the
+    # transcript, and the deadlock existed solely in dmesg.
+    out = (r.stdout or "") + (r.stderr or "")
+    broke = "deadlock" in out.lower()
+    return (r.returncode == 0 and not broke), out.strip()
+
+
+def pump_claims(events: str, turn: int, seen: set) -> None:
+    """
+    Turn blocked agents into wait-for edges, once each.
+
+    An agent that cannot take a claim writes <resource>.want.<tx> naming
+    who holds it. It cannot declare the edge itself: /dev/agenttx is
+    root-only, deliberately, because anything that can open it can commit
+    and abort transactions that are not its own. So the orchestrator --
+    which is root, and is already supervising these agents -- does it.
+    """
+    try:
+        names = os.listdir(CLAIM_DIR)
+    except OSError:
+        return
+    for n in names:
+        if ".want." not in n:
+            continue
+        resource, _, waiter = n.partition(".want.")
+        try:
+            with open(os.path.join(CLAIM_DIR, n)) as f:
+                holder = f.read().strip()
+        except OSError:
+            continue
+        if not holder or holder == waiter:
+            continue
+        key = (waiter, holder)
+        if key in seen:
+            continue
+        seen.add(key)
+        ok, detail = declare_wait(waiter, holder)
+        emit(events, {"type": "tx_wait_edge", "turn": turn,
+                      "waiter": waiter, "holder": holder,
+                      "resource": resource, "accepted": ok,
+                      "detail": detail})
+        if not ok:
+            emit(events, {"type": "tx_notice", "turn": turn,
+                          "text": ("DEADLOCK — transaction %s waiting on %s "
+                                   "for '%s' closed a cycle. Every one of "
+                                   "those waits was legitimate; together "
+                                   "they cannot all be satisfied. The kernel "
+                                   "found it the moment the edge went in, "
+                                   "picked the least-severe transaction in "
+                                   "the cycle and aborted it. That agent's "
+                                   "work is gone; the others carry on.\n\n%s"
+                                   % (waiter, holder, resource, detail))})
+
+
+def release_claims(txs) -> None:
+    """Drop claims held by transactions that are over."""
+    try:
+        names = os.listdir(CLAIM_DIR)
+    except OSError:
+        return
+    alive = {str(t) for t in txs}
+    for n in names:
+        p = os.path.join(CLAIM_DIR, n)
+        if ".want." in n:
+            continue
+        try:
+            with open(p) as f:
+                holder = f.read().strip()
+        except OSError:
+            continue
+        if holder and holder not in alive:
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+
+def live_txs() -> set:
+    out = set()
+    try:
+        with open("/sys/kernel/debug/agenttx/transactions") as f:
+            for line in f.read().splitlines()[1:]:
+                f0 = line.split()
+                if f0:
+                    out.add(f0[0])
+    except OSError:
+        pass
     return out
 
 
@@ -252,6 +369,20 @@ def main() -> int:
     # else, or to a run that is already over. See session_of().
     pre_existing = set(glob.glob(os.path.join(SESSION_DIR, "session-*")))
 
+    # Claims from earlier runs are held by transactions that no longer
+    # exist; leaving them makes the first agent wait on a ghost.
+    # Sticky, world-writable, like /tmp.
+    #
+    # /run/agenttx is 0700 root, so an agent cannot create anything under
+    # it -- every claim came back PermissionError, and the agents cheerfully
+    # reported success anyway. The orchestrator is root and makes this
+    # directory once, here. The sticky bit matters: agents may create their
+    # own lock files but not remove each other's, which is exactly the
+    # property a shared lock directory needs.
+    os.makedirs(CLAIM_DIR, exist_ok=True)
+    os.chmod(CLAIM_DIR, 0o1777)
+    release_claims(live_txs())
+
     # Each agent gets its own subtask file and its own transaction.
     procs = {}
     for p in parts:
@@ -259,7 +390,7 @@ def main() -> int:
                   encoding="utf-8") as f:
             f.write(p["task"])
         procs[p["name"]] = launch(td, a.turn, a.lower, a.runas, p["name"],
-                                  a.model)
+                                  a.model, len(parts))
         emit(events, {"type": "swarm_agent_start", "turn": a.turn,
                       "agent": p["name"], "task": p["task"]})
         # Stagger slightly: txctl registers a supervisor per session and
@@ -281,7 +412,14 @@ def main() -> int:
     txs = {}
     deadline = time.time() + 1800
     pending = set(procs)
+    seen_edges = set()
     while pending and time.time() < deadline:
+        # Blocked agents become wait-for edges, and finished transactions
+        # give their claims back. Both have to happen while the agents are
+        # still running, which is why this is in the wait loop and not
+        # after it.
+        pump_claims(events, a.turn, seen_edges)
+        release_claims(live_txs())
         for name in sorted(pending):
             d = session_of(name, pre_existing)
             if not d:

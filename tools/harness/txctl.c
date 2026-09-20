@@ -246,7 +246,22 @@ static const char *const state_names[] = TX_STATE_NAMES;
 
 static int dev_open(void)
 {
-	int fd = open(AGENTTX_DEV_PATH, O_RDWR);
+	/*
+	 * O_CLOEXEC, and it matters more than it looks.
+	 *
+	 * Without it every command the harness runs -- the agent, the shell
+	 * turn, anything it spawns -- inherits this descriptor across exec
+	 * and holds a reference to the module for as long as it lives. Kill
+	 * txctl and the module stays pinned by a `sleep` that cannot even
+	 * use the device: it is root-only, and most of these children are
+	 * not root.
+	 *
+	 * That is the root of a failure already patched twice from the far
+	 * end -- "Module agenttx is in use" with no obvious holder, and a
+	 * test suite that went red naming whichever test happened to run
+	 * next. The child has no business holding the control device.
+	 */
+	int fd = open(AGENTTX_DEV_PATH, O_RDWR | O_CLOEXEC);
 
 	if (fd < 0) {
 		fprintf(stderr, "txctl: open %s: %s\n",
