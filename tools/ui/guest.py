@@ -976,3 +976,105 @@ def structure(link: "GuestLink", tx: str) -> dict:
     if len(out["untouched"]) >= 4000 or len(out["changed"]) >= 4000:
         out["truncated"] = True
     return out
+
+
+# ======================================================================
+# A terminal inside a transaction
+# ======================================================================
+#
+# "Can I run it and see the output before I press Keep?" is the question
+# this whole system should be able to answer yes to, and until now could
+# not. The answer is the overlay's MERGED view: the folder exactly as it
+# would look if the transaction committed. Run the code there and you are
+# running the post-commit state without committing.
+#
+# The catch is where that view lives. tx_setup_overlay() mounts the
+# overlay in a PRIVATE MOUNT NAMESPACE belonging to the transaction's
+# holder process, so from anywhere else /var/lib/agenttx/tx-N/merged is an
+# empty directory -- which is correct isolation and exactly why a shell
+# cannot simply cd into it.
+#
+# So we enter that namespace. The holder's pid is already published: it is
+# the last column of /sys/kernel/debug/agenttx/transactions, which is also
+# why a transaction the kernel has forgotten cannot be entered by mistake.
+#
+# Commands run here are INSIDE the transaction, which is the point and
+# also the caveat: `python3 calc.py` will leave a __pycache__ behind, and
+# that shows up in the diff like any other change. The UI says so.
+
+TX_EXEC_SH = r"""
+set -u
+TX=%(tx)s
+DBG=/sys/kernel/debug/agenttx/transactions
+PID=$(awk -v t="$TX" 'NR>1 && $1==t {print $6}' "$DBG" 2>/dev/null | head -1)
+if [ -z "${PID:-}" ]; then
+  echo "transaction $TX is not open any more -- nothing to run it against." >&2
+  exit 7
+fi
+# Work at the REAL path, not at .../merged.
+#
+# tx_setup_overlay bind-mounts the merged view over the protected
+# directory inside this namespace, so /tmp/repo IS the merged view here.
+# Using the merged path directly also works for simple tools but breaks
+# the moment anything resolves an absolute path: python3 turns "calc.py"
+# into /var/lib/agenttx/tx-N/merged/calc.py and then cannot traverse
+# /var/lib/agenttx, which is 0700 root on purpose. `grep calc.py`
+# succeeded and `python3 calc.py` failed with EACCES, from the same shell,
+# in the same directory.
+M=$(readlink "/var/lib/agenttx/tx-$TX/lower" 2>/dev/null)
+[ -n "${M:-}" ] || M=/var/lib/agenttx/tx-$TX/merged
+OWNER=$(stat -c %%U "/var/lib/agenttx/tx-$TX/merged" 2>/dev/null || echo root)
+
+# The command arrives through a quoted heredoc, so nothing in it is
+# expanded, word-split or re-quoted on the way. Escaping a user's shell
+# line through three layers of quotes is a bug generator; this has none.
+CMD=$(cat <<'TXCMD_EOF'
+%(cmd)s
+TXCMD_EOF
+)
+export M OWNER CMD
+
+# cd FIRST, as root, and only then drop privileges.
+#
+# /var/lib/agenttx is mode 0700 root -- deliberately, so the sandboxed
+# user cannot walk into other transactions' layers -- which means the
+# agent's own user cannot traverse INTO merged either. It works during a
+# run because txctl chdir's there before dropping privileges, and once
+# your cwd is inside a directory you no longer need traverse permission
+# on its ancestors. Same trick here: enter the namespace as root, cd, then
+# become the agent.
+exec timeout %(timeout)s nsenter -t "$PID" -m -- \
+  sh -c 'cd "$M" && exec su -s /bin/sh "$OWNER" -c "$CMD"' 2>&1
+"""
+
+
+def tx_exec(link: "GuestLink", tx: str, cmd: str,
+            timeout: int = 45) -> tuple[int, str]:
+    """
+    Run `cmd` inside transaction `tx`, against the folder as it WOULD be.
+
+    Returns (exit code, combined output). Exit 7 means the transaction is
+    gone; anything else is the command's own status.
+    """
+    if not link.alive():
+        return 1, "the sandbox is not reachable"
+    # NO escaping. The command goes into a QUOTED heredoc, where the shell
+    # expands nothing and unescapes nothing, so anything done to it here
+    # survives verbatim into the command line. The first version
+    # backslash-escaped every quote and the agent's shell then saw literal
+    # \" -- `printf "%s|"` came back as `sh: 1: ": not found`.
+    #
+    # The one thing that must not appear is the terminator itself, which
+    # would end the heredoc early and run the remainder as shell.
+    body = "\n".join(l for l in cmd.splitlines()
+                      if l.strip() != "TXCMD_EOF") or "true"
+    script = TX_EXEC_SH % {
+        "tx": shlex.quote(str(tx)),
+        "cmd": body,
+        "timeout": int(timeout),
+    }
+    rc, so, se = link._run_stdin(script)
+    out = (so or "") + (se or "")
+    if rc == 124:
+        out += "\n[stopped after %ds]" % timeout
+    return rc, out

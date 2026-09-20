@@ -183,3 +183,10 @@ QHeaderView::section {
   background: #10161f; color: #6b7a8d; border: none;
   border-bottom: 1px solid #1c2531; padding: 5px 8px; font-size: 11px;
 }
+
+#TermInput {
+  background: #0a0e14; border: 1px solid #222c3a; border-radius: 8px;
+  color: #e6edf3; font-family: "JetBrains Mono", "DejaVu Sans Mono", monospace;
+  font-size: 12.5px; padding: 8px 10px;
+}
+#TermInput:focus { border: 1px solid #3fb950; }

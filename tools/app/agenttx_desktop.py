@@ -48,7 +48,8 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout,  # noqa: E402
                              QTextEdit, QTreeWidget, QTreeWidgetItem,
                              QVBoxLayout, QWidget)
 
-from guest import AgentThreads, GuestLink, structure as STRUCTURE  # noqa: E402
+from guest import (AgentThreads, GuestLink,  # noqa: E402
+                   structure as STRUCTURE, tx_exec as TX_EXEC)
 
 GUEST = GuestLink()
 THREADS = AgentThreads(GUEST)
@@ -766,9 +767,141 @@ class FileTree(QWidget):
         self.tree.resizeColumnToContents(0)
 
 
+class TxTerminal(QWidget):
+    """
+    A shell inside a pending transaction.
+
+    The question this exists to answer is "can I run it and see the real
+    output before I press Keep?", and the answer is yes because of what a
+    transaction already is. The overlay's merged view is the folder
+    exactly as it would look if committed, so running the code there runs
+    the post-commit state without committing it. You can execute the
+    agent's edit, read the traceback, and still throw the whole thing
+    away.
+
+    Two things are deliberately visible in the UI rather than buried:
+
+      - you are the AGENT here, not root, so what you can do is what the
+        agent could have done;
+      - commands run INSIDE the transaction, so `python3 x.py` leaves a
+        __pycache__ behind and that shows up in the diff like any other
+        change. Rehearsing is not free, and pretending it is would make
+        the review surface lie.
+    """
+
+    run_cmd = pyqtSignal(str, str)          # tx, command
+
+    def __init__(self):
+        super().__init__()
+        self.tx = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(7)
+
+        self.head = lab("", "Sub", wrap=True)
+        v.addWidget(self.head)
+
+        self.out = QTextEdit()
+        self.out.setReadOnly(True)
+        self.out.setObjectName("DiffView")
+        self.out.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        self.out.setMinimumHeight(120)
+        v.addWidget(self.out, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self.prompt = lab("$", selectable=False)
+        self.prompt.setStyleSheet(
+            "color:#3fb950;font-family:'JetBrains Mono',monospace;"
+            "font-size:13px;")
+        self.input = QLineEdit()
+        self.input.setObjectName("TermInput")
+        self.input.setPlaceholderText(
+            "python3 calc.py   ·   pytest -q   ·   git diff --stat")
+        self.input.returnPressed.connect(self._go)
+        self.btn = QPushButton("Run")
+        self.btn.setObjectName("Dispatch")
+        self.btn.clicked.connect(self._go)
+        row.addWidget(self.prompt)
+        row.addWidget(self.input, 1)
+        row.addWidget(self.btn)
+        v.addLayout(row)
+
+        v.addWidget(lab(
+            "You are the agent's user, in the folder as it WOULD be. "
+            "Anything this writes stays in the sandbox layer — and shows "
+            "up in the diff, so a test run that leaves __pycache__ behind "
+            "will appear there too.", "Muted", wrap=True))
+
+        # Up/Down through what you already ran: every one of these is
+        # "run it, edit it slightly, run it again".
+        self._hist = []
+        self._at = 0
+        self.input.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.input and ev.type() == ev.Type.KeyPress:
+            if ev.key() == Qt.Key.Key_Up and self._hist:
+                self._at = max(0, self._at - 1)
+                self.input.setText(self._hist[self._at])
+                return True
+            if ev.key() == Qt.Key.Key_Down and self._hist:
+                self._at = min(len(self._hist), self._at + 1)
+                self.input.setText(self._hist[self._at]
+                                   if self._at < len(self._hist) else "")
+                return True
+        return super().eventFilter(obj, ev)
+
+    def set_tx(self, tx, agent=None):
+        self.tx = str(tx) if tx else None
+        ok = self.tx is not None
+        self.input.setEnabled(ok)
+        self.btn.setEnabled(ok)
+        if ok:
+            self.head.setText(
+                "Running inside <b>layer %s</b>%s — the folder as it would "
+                "be if you pressed Keep. Your real folder is not involved."
+                % (self.tx, (" · " + agent) if agent else ""))
+        else:
+            self.head.setText(
+                "No transaction is open. A terminal here only means "
+                "something while there is a pending change to run against.")
+
+    def _go(self):
+        cmd = self.input.text().strip()
+        if not cmd or not self.tx:
+            return
+        self._hist.append(cmd)
+        self._at = len(self._hist)
+        self.input.clear()
+        self._append("$ " + cmd, "#79c0ff")
+        self.btn.setEnabled(False)
+        self.run_cmd.emit(self.tx, cmd)
+
+    def _append(self, text, colour="#9fb0c3"):
+        self.out.append(
+            "<pre style='margin:0;color:%s;white-space:pre-wrap'>%s</pre>"
+            % (colour, esc(text)))
+        self.out.verticalScrollBar().setValue(
+            self.out.verticalScrollBar().maximum())
+
+    def result(self, rc, output):
+        self.btn.setEnabled(True)
+        if output.strip():
+            self._append(output.rstrip(),
+                         "#ff7b72" if rc not in (0,) else "#9fb0c3")
+        if rc == 7:
+            self._append("[that transaction is gone — nothing to run "
+                         "against]", "#d29922")
+        elif rc != 0:
+            self._append("[exit %s]" % rc, "#d29922")
+        self.input.setFocus()
+
+
 class HoodView(QWidget):
     want_structure = pyqtSignal(str)
     want_file_diff = pyqtSignal(str, str)
+    want_exec = pyqtSignal(str, str)
 
     """
     Everything the normal view deliberately hides.
@@ -801,11 +934,22 @@ class HoodView(QWidget):
         sp.setSpacing(8)
         self.stack_view = LayerStack()
         self.diffview = DiffView()
-        self.diffview.setMinimumHeight(220)
+        # A tall tab page sets the whole WINDOW's minimum height, and the
+        # window is what has to fit on a screen. At 220 here plus the
+        # layer picture the window could not go below ~930px, so on a
+        # 1080p display with a panel the composer -- the only place you
+        # type -- ended up underneath the taskbar. Small minimums, and the
+        # page scrolls if it needs to.
+        self.diffview.setMinimumHeight(120)
         self.diffhead = lab("Click a layer above to see its lines", "Muted",
                             selectable=False)
         self.stack_view.show_tx.connect(self._show_tx)
-        sp.addWidget(self.stack_view, 1)
+        stackscroll = QScrollArea()
+        stackscroll.setWidgetResizable(True)
+        stackscroll.setFrameShape(QFrame.Shape.NoFrame)
+        stackscroll.setWidget(self.stack_view)
+        stackscroll.setMinimumHeight(150)
+        sp.addWidget(stackscroll, 2)
         sp.addWidget(self.diffhead)
         sp.addWidget(self.diffview, 1)
 
@@ -826,10 +970,17 @@ class HoodView(QWidget):
         tp.addLayout(row)
         self.tree = FileTree()
         self.tree.file_picked.connect(self._tree_file)
+        self.tree.tree.setMinimumHeight(140)
         tp.addWidget(self.tree, 1)
 
         self.tabs.addTab(self.stackpage, "Live layers")
         self.tabs.addTab(self.treepage, "File structure")
+
+        # A terminal, third: after you have seen WHAT changed and WHERE,
+        # the next question is whether it actually works.
+        self.term = TxTerminal()
+        self.term.run_cmd.connect(self.want_exec.emit)
+        self.tabs.addTab(self.term, "Try it")
         self.tabs.addTab(self.kernel, "Kernel state")
         self.tabs.addTab(self.effects, "Intercepted effects")
         self.tabs.addTab(self.research, "Measurements")
@@ -843,6 +994,7 @@ class HoodView(QWidget):
         tx = self.treepick.currentData()
         if tx:
             self.want_structure.emit(str(tx))
+            self.term.set_tx(tx, self._agents.get(str(tx)))
 
     def _tree_file(self, path):
         """One file from the tree: show just that file's lines."""
@@ -881,6 +1033,9 @@ class HoodView(QWidget):
                       if cur in [w[0] for w in want] else 0)
             self.treepick.setCurrentIndex(idx)
             self.want_structure.emit(want[idx][0])
+            self.term.set_tx(want[idx][0], want[idx][1])
+        else:
+            self.term.set_tx(None)
 
     def _show_tx(self, tx):
         self._open_tx = tx
@@ -1703,7 +1858,10 @@ class Main(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("AgentTx")
-        self.resize(1320, 860)
+        # Fits a 1080p screen with a panel and window decorations still
+        # on it. At 860 the window came out 1071px tall and the composer
+        # -- the only place you type -- sat underneath the taskbar.
+        self.resize(1280, 760)
         self.threads = []
         self.sessions = []
         self.selected = None            # thread id
@@ -1794,6 +1952,7 @@ class Main(QMainWindow):
         self.hoodview = HoodView()
         self.hoodview.want_structure.connect(self.fetch_structure)
         self.hoodview.want_file_diff.connect(self.fetch_file_diff)
+        self.hoodview.want_exec.connect(self.run_in_tx)
         self.stack.addWidget(self.chat)
         self.stack.addWidget(self.hoodview)
 
@@ -1919,6 +2078,16 @@ class Main(QMainWindow):
             self.hoodview.diffview.show_diff(tx, one)
             self.hoodview.diffhead.setText("%s in layer %s" % (path, tx))
         run_async(self, GUEST.session_diff, tx, then=got)
+
+    def run_in_tx(self, tx, cmd):
+        """Run one command inside a pending transaction, off the GUI thread."""
+        def got(res):
+            if isinstance(res, Exception):
+                self.hoodview.term.result(1, str(res))
+            else:
+                rc, out = res
+                self.hoodview.term.result(rc, out)
+        run_async(self, TX_EXEC, GUEST, tx, cmd, then=got)
 
     def refresh_hood(self):
         if not self.hood.isChecked():

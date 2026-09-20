@@ -78,6 +78,40 @@ rewritten and none of it has happened yet.
 
 Then press Keep, and run it again.
 
+## Running it before you keep it
+
+**Under the hood → Try it** is a shell inside the pending transaction.
+You are in the folder exactly as it would be if you pressed Keep, so you
+can execute the agent's change and read the real output — and still throw
+all of it away.
+
+    $ head -3 src/flask/__init__.py
+    # SPDX-License-Identifier: BSD-3-Clause
+    from . import json as json
+
+    $ grep -rLx "# SPDX-License-Identifier: BSD-3-Clause" --include="*.py" src | wc -l
+    0
+
+    $ python3 -c 'import ast; ast.parse(open("src/flask/app.py").read()); print("still parses")'
+    still parses
+
+The same commands in a normal guest shell show the unmodified files,
+because they are unmodified: nothing has been committed.
+
+Two things are deliberately true of that shell:
+
+- **you are the agent's user, not root.** A rehearsal that can do more
+  than the agent could is a poor guide to what committing will do.
+- **it runs inside the transaction.** `python3 calc.py` leaves a
+  `__pycache__` behind, and that shows up in the diff like any other
+  change. Rehearsing is not free, and hiding that would make the review
+  surface lie.
+
+It works by entering the transaction's mount namespace. The overlay is
+bind-mounted over the protected directory *inside that namespace only*,
+which is why `/tmp/repo` is the merged view there and the untouched
+original everywhere else.
+
 ## The no-model version
 
 The same work with no model at all, as one shell turn — type this into
