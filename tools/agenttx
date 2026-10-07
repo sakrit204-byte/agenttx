@@ -14,7 +14,7 @@ while you are building it and useless when you want to use it.
     agenttx sh "..."             run one shell command (no model, no cost)
     agenttx layers               live transactions and the wait-for graph
     agenttx cat TX FILE          read a file as it would be after commit
-    agenttx open TX              copy the changed files out for your editor
+    agenttx open TX [FILE]       open it in your editor (both versions)
     agenttx try TX "..."         run something inside a pending transaction
     agenttx keep TX | drop TX    decide
     agenttx demo                 put a real git checkout in the sandbox
@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -138,9 +139,16 @@ def cmd_status(a):
 
 
 # ---------------------------------------------------------------- running
+def _live_tx():
+    """Transaction ids the KERNEL currently has."""
+    rc, out, _e = G.run("tail -n +2 /sys/kernel/debug/agenttx/transactions "
+                        "2>/dev/null | awk '{print $1}'", timeout=30)
+    return set(out.split()) if rc == 0 else set()
+
+
 def _stream(thread, since=0, quiet=False):
-    """Follow a turn's transcript until it ends. Returns the last tx id."""
-    seen_end, tx = False, None
+    """Follow a turn's transcript until it ends."""
+    seen_end = False
     while not seen_end:
         evs, since = T.events(thread, since)
         for e in evs:
@@ -180,10 +188,7 @@ def _stream(thread, since=0, quiet=False):
                 seen_end = True
         if not seen_end:
             time.sleep(1)
-    for s in G.sessions():
-        if s.get("status") == "awaiting-decision":
-            tx = s.get("tx")
-    return tx
+    return since
 
 
 def _run(a, shell):
@@ -191,14 +196,35 @@ def _run(a, shell):
     thread = a.thread or ("cli-%d" % int(time.time()))
     text = " ".join(a.text)
     if shell:
-        T.start_shell(thread, a.folder, text, text[:60])
+        _rc, out, _e = T.start_shell(thread, a.folder, text, text[:60])
     else:
         mode = "swarm" if a.agents > 1 else ("claude" if a.claude else "local")
-        T.start_turn(thread, a.folder, text, text[:60], str(uuid.uuid4()),
-                     "agent", mode, a.agents, a.model)
+        _rc, out, _e = T.start_turn(thread, a.folder, text, text[:60],
+                                    str(uuid.uuid4()), "agent", mode,
+                                    a.agents, a.model)
+    # Take the id from the START, not from whichever session happens to
+    # say "awaiting-decision" afterwards.
+    #
+    # /run/agenttx is littered with directories from dead runs whose status
+    # file still says they are waiting -- the process was killed before it
+    # could write the ending -- so scanning for one picks a stale
+    # transaction, its diff is empty, and a turn that really did change
+    # three files reports "nothing changed".
+    txs = re.findall(r"tx=(\d+)", out or "")
     say("%s· %s in %s%s" % (C_DIM, thread, a.folder, C_OFF))
-    tx = _stream(thread)
-    _after(tx)
+    _stream(thread)
+
+    live = _live_tx()
+    mine = [t for t in txs if t in live]
+    if not mine:
+        # A swarm opens several; fall back to whatever is live and waiting.
+        waiting = {s.get("tx") for s in G.sessions()
+                   if s.get("status") == "awaiting-decision"}
+        mine = sorted(live & waiting)
+    for t in mine:
+        _after(t)
+    if not mine:
+        say("\nnothing is waiting on a decision.")
 
 
 def _after(tx):
@@ -206,7 +232,7 @@ def _after(tx):
         return
     diff = G.session_diff(tx)
     if isinstance(diff, Exception) or not diff:
-        say("\nnothing changed.")
+        say("\ntransaction %s changed nothing." % tx)
         return
     say("")
     for d in diff[:25]:
@@ -300,41 +326,74 @@ def cmd_cat(a):
     sys.stdout.write(out)
 
 
+def _launch(path):
+    """Hand it to whatever the desktop uses. Never fatal if there isn't one."""
+    try:
+        subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+
 def cmd_open(a):
     """Copy the changed files out where an editor can open them."""
     need_guest()
-    dest = a.to or ("/tmp/agenttx-tx%s" % a.tx)
-    os.makedirs(dest, exist_ok=True)
-    rc, b64, err = G.run("tar -C %s -cz . 2>/dev/null | base64 -w0"
-                         % _upper(a.tx), timeout=120)
-    if rc != 0 or not b64.strip():
-        say("nothing to open — transaction %s has changed no files." % a.tx)
-        raise SystemExit(1)
-    import base64 as _b64
-    tar = _b64.b64decode(b64.strip())
-    p = subprocess.run(["tar", "-C", dest, "-xz"], input=tar,
-                       capture_output=True)
-    if p.returncode != 0:
-        say("%scould not unpack: %s%s"
-            % (C_BAD, p.stderr.decode()[:200], C_OFF))
-        raise SystemExit(1)
 
-    files = []
-    for root, _d, fs in os.walk(dest):
-        for f in fs:
-            files.append(os.path.relpath(os.path.join(root, f), dest))
-    say("%d file(s) from transaction %s are in:\n  %s\n"
-        % (len(files), a.tx, dest))
-    for f in sorted(files)[:40]:
-        say("  %s" % f)
+    if a.file:
+        # One file, BOTH versions, named so you can tell them apart with
+        # two tabs open: notes.txt becomes notes.NOW.txt and
+        # notes.AFTER.txt. The extension stays last so the editor still
+        # highlights it.
+        from guest import file_version
+        dest = a.to or ("/tmp/agenttx-tx%s" % a.tx)
+        os.makedirs(dest, exist_ok=True)
+        base = os.path.basename(a.file) or "file"
+        stem, dot, ext = base.rpartition(".")
+        opened = []
+        for which, tag in (("before", "NOW"), ("after", "AFTER")):
+            status, text = file_version(G, a.tx, a.file, which)
+            if status != "ok":
+                say("%s%-5s: %s%s" % (C_DIM, tag, status, C_OFF))
+                continue
+            name = ("%s.%s.%s" % (stem, tag, ext)) if dot else "%s.%s" % (base, tag)
+            out = os.path.join(dest, name)
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(text)
+            opened.append(out)
+            say("%-5s %s" % (tag, out))
+        if not opened:
+            say("nothing to open for %s" % a.file)
+            raise SystemExit(1)
+        if not a.no_launch:
+            for o in opened:
+                _launch(o)
+        say("\n%sCopies, for reading. Editing them does not change the"
+            " transaction.%s" % (C_DIM, C_OFF))
+        return
 
-    # Say plainly that this is a COPY. Somebody who edits here expecting
-    # the transaction to change would otherwise press Keep and get the
-    # agent's version, not theirs, with no indication anything was lost.
-    say("\n%sThis is a COPY, for reading. Editing it does not change the"
-        % C_DIM)
-    say("transaction. If you do edit and want those edits kept:%s" % C_OFF)
-    say("  agenttx push %s %s" % (a.tx, dest))
+    # No file named: both whole sides, as two directories a diff tool can
+    # compare -- which is what you want once more than a couple of files
+    # have changed.
+    from guest import export_version
+    made = []
+    for which in ("before", "after"):
+        dest = (a.to + "-" + which) if a.to \
+            else "/tmp/agenttx-tx%s-%s" % (a.tx, which)
+        n, msg = export_version(G, a.tx, which, dest)
+        say("%-6s %d file(s) -> %s" % (which, n, msg))
+        if n:
+            made.append(dest)
+    if not made:
+        say("nothing to open — transaction %s changed no files." % a.tx)
+        raise SystemExit(1)
+    if len(made) == 2:
+        say("\ncompare them with:  diff -ru %s %s" % (made[0], made[1]))
+    if not a.no_launch:
+        for d in made:
+            _launch(d)
+    say("%sCopies, for reading. To put edits back: agenttx push %s DIR%s"
+        % (C_DIM, a.tx, C_OFF))
 
 
 def cmd_push(a):
@@ -487,9 +546,13 @@ def main():
     q.add_argument("tx")
     q.add_argument("path")
 
-    q = add("open", cmd_open, "copy the changed files out for your editor")
+    q = add("open", cmd_open, "open the changed files in your editor")
     q.add_argument("tx")
+    q.add_argument("file", nargs="?",
+                   help="one file: opens BOTH versions. omit for all of them")
     q.add_argument("--to", help="where to put them (default /tmp/agenttx-txN)")
+    q.add_argument("--no-launch", action="store_true",
+                   help="write the copies but do not open an editor")
 
     q = add("push", cmd_push, "write edits from that copy back in")
     q.add_argument("tx")

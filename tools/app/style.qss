@@ -190,3 +190,11 @@ QHeaderView::section {
   font-size: 12.5px; padding: 8px 10px;
 }
 #TermInput:focus { border: 1px solid #3fb950; }
+
+/* "now" / "after" — small, quiet, always in pairs. */
+#VerBtn {
+  background: #16202e; color: #9fb0c3; border: 1px solid #27374d;
+  border-radius: 5px; padding: 1px 8px; font-size: 10.5px;
+}
+#VerBtn:hover { background: #1e2c40; color: #e6edf3; border-color: #3a4d68; }
+#VerBtn:disabled { background: #0e141c; color: #3a4252; border-color: #19212c; }

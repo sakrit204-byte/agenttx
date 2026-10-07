@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -49,6 +50,8 @@ from PyQt6.QtWidgets import (QApplication, QFrame, QHBoxLayout,  # noqa: E402
                              QVBoxLayout, QWidget)
 
 from guest import (AgentThreads, GuestLink,  # noqa: E402
+                   export_version as EXPORT_VERSION,
+                   file_version as FILE_VERSION,
                    structure as STRUCTURE, tx_exec as TX_EXEC)
 
 GUEST = GuestLink()
@@ -341,6 +344,42 @@ class FileCard(QFrame):
 # coloured the way a diff is always coloured.
 
 
+def version_buttons(on_click, kind=None, compact=True):
+    """
+    The two ways to look at a pending change: as it is, and as it would be.
+
+    Both are offered everywhere a file or a layer is listed, because the
+    question a person is actually answering -- do I keep this? -- is a
+    comparison, and making them hunt for the other half of it is how a
+    review turns into a glance.
+
+    A created file has no "now" and a deleted one has no "after"; the
+    button for the side that does not exist is disabled rather than
+    hidden, so the layout does not shift and the absence is itself
+    information.
+    """
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(4)
+    for which, label, tip in (
+            ("before", "now", "the file as it is in your folder right now"),
+            ("after", "after", "the file as it would be if you press Keep")):
+        b = QPushButton(label)
+        b.setObjectName("VerBtn")
+        b.setToolTip(tip)
+        b.setFixedHeight(20 if compact else 24)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        if (kind == "created" and which == "before") or \
+           (kind == "deleted" and which == "after"):
+            b.setEnabled(False)
+            b.setToolTip("this file is %s, so there is no '%s' version"
+                         % (kind, label))
+        b.clicked.connect(lambda _=False, k=which: on_click(k))
+        h.addWidget(b)
+    return w
+
+
 class FileChip(QFrame):
     """One changed file inside a layer."""
 
@@ -351,7 +390,7 @@ class FileChip(QFrame):
         "dir":      ("#6b7a8d", "folder"),
     }
 
-    def __init__(self, d):
+    def __init__(self, d, on_version=None):
         super().__init__()
         self.setObjectName("Chip")
         colour, word = self.KIND.get(d.get("kind"), ("#8b9aad", d.get("kind")))
@@ -384,6 +423,10 @@ class FileChip(QFrame):
             w.setStyleSheet("color: %s; font-size: 10.5px;"
                             " background: transparent;" % colour)
             h.addWidget(w)
+        if on_version:
+            path = d.get("path", "")
+            h.addWidget(version_buttons(
+                lambda which, p=path: on_version(p, which), d.get("kind")))
 
 
 class TxCard(QFrame):
@@ -392,7 +435,8 @@ class TxCard(QFrame):
     clicked = pyqtSignal(str)
     hovered = pyqtSignal(str)
 
-    def __init__(self, tx, agent, state, diff, lower):
+    def __init__(self, tx, agent, state, diff, lower,
+                 on_version=None, on_export=None):
         super().__init__()
         self.tx = str(tx)
         self.setObjectName("TxCard")
@@ -418,13 +462,25 @@ class TxCard(QFrame):
 
         if diff:
             for d in diff[:8]:
-                v.addWidget(FileChip(d))
+                v.addWidget(FileChip(
+                    d, (lambda p, w, t=self.tx: on_version(t, p, w))
+                    if on_version else None))
             if len(diff) > 8:
                 v.addWidget(lab("+%d more" % (len(diff) - 8), "Muted",
                                 selectable=False))
         else:
             v.addWidget(lab("nothing changed yet", "Muted", selectable=False))
 
+        if on_export and diff:
+            row = QHBoxLayout()
+            row.setSpacing(6)
+            row.addWidget(lab("whole layer:", "Muted", selectable=False))
+            row.addWidget(version_buttons(
+                lambda which, t=self.tx: on_export(t, which), compact=False))
+            row.addStretch(1)
+            holder = QWidget()
+            holder.setLayout(row)
+            v.addWidget(holder)
         v.addWidget(lab("click to see the lines", "Muted", selectable=False))
 
     def enterEvent(self, e):
@@ -529,6 +585,8 @@ class LayerStack(QWidget):
     """The picture: your folder underneath, the agents' layers on top."""
 
     show_tx = pyqtSignal(str)
+    show_file = pyqtSignal(str, str, str)      # tx, path, before|after
+    export = pyqtSignal(str, str)              # tx, before|after
 
     def __init__(self):
         super().__init__()
@@ -608,7 +666,9 @@ class LayerStack(QWidget):
             for t in live:
                 tx = t["tx"]
                 c = TxCard(tx, agents.get(str(tx)), t.get("state"),
-                           diffs.get(str(tx)), lowers.get(tx))
+                           diffs.get(str(tx)), lowers.get(tx),
+                           on_version=self.show_file.emit,
+                           on_export=self.export.emit)
                 c.clicked.connect(self.show_tx.emit)
                 self.cards.addWidget(c)
             self.cards.addStretch(1)
@@ -647,6 +707,7 @@ class FileTree(QWidget):
     """
 
     file_picked = pyqtSignal(str)
+    show_file = pyqtSignal(str, str)           # path, before|after
 
     MARK = {
         "created":  ("#3fb950", "new"),
@@ -666,8 +727,8 @@ class FileTree(QWidget):
 
         self.tree = QTreeWidget()
         self.tree.setObjectName("Tree")
-        self.tree.setColumnCount(2)
-        self.tree.setHeaderLabels(["file", "what happened to it"])
+        self.tree.setColumnCount(3)
+        self.tree.setHeaderLabels(["file", "what happened to it", "open"])
         self.tree.setRootIsDecorated(True)
         self.tree.setUniformRowHeights(True)      # keeps 4000 rows smooth
         self.tree.header().setStretchLastSection(True)
@@ -745,9 +806,18 @@ class FileTree(QWidget):
                 f = it.font(0); f.setBold(True); it.setFont(0, f)
             else:
                 it.setForeground(0, QColor("#4b5666"))
+            return it
 
         for path in sorted(changed):
-            add(path, changed[path]["kind"])
+            it = add(path, changed[path]["kind"])
+            # Buttons only on CHANGED rows. An untouched file has one
+            # version, so offering two would be a lie, and putting a widget
+            # on every row of a four-thousand-entry tree is slow enough to
+            # be felt.
+            if it is not None:
+                self.tree.setItemWidget(it, 2, version_buttons(
+                    lambda which, p=path: self.show_file.emit(p, which),
+                    changed[path]["kind"]))
         # Cap the untouched half: it is context, not the subject, and a
         # project with 30k files should not freeze the panel to show them.
         for path in untouched[:1500]:
@@ -902,6 +972,9 @@ class HoodView(QWidget):
     want_structure = pyqtSignal(str)
     want_file_diff = pyqtSignal(str, str)
     want_exec = pyqtSignal(str, str)
+    want_version = pyqtSignal(str, str, str)   # tx, path, before|after
+    want_export = pyqtSignal(str, str)         # tx, before|after
+    want_open_external = pyqtSignal(str, str, str)   # tx, path, which
 
     """
     Everything the normal view deliberately hides.
@@ -943,14 +1016,34 @@ class HoodView(QWidget):
         self.diffview.setMinimumHeight(120)
         self.diffhead = lab("Click a layer above to see its lines", "Muted",
                             selectable=False)
+        self.diffhead.setWordWrap(True)
+        # Reading it here is enough most of the time; sometimes you want it
+        # in the editor you actually use, with your own syntax
+        # highlighting and your own search. Showing it in the pane and
+        # handing it to the desktop are different jobs, so they are
+        # different buttons -- clicking "after" should not spawn an editor
+        # you did not ask for.
+        self.openext = QPushButton("Open in editor  ↗")
+        self.openext.setObjectName("Hood")
+        self.openext.setEnabled(False)
+        self.openext.clicked.connect(self._open_external)
+        headrow = QHBoxLayout()
+        headrow.setContentsMargins(0, 0, 0, 0)
+        headrow.addWidget(self.diffhead, 1)
+        headrow.addWidget(self.openext)
+        headwrap = QWidget()
+        headwrap.setLayout(headrow)
+        self._shown = None            # (tx, path, which) currently displayed
         self.stack_view.show_tx.connect(self._show_tx)
+        self.stack_view.show_file.connect(self.want_version.emit)
+        self.stack_view.export.connect(self.want_export.emit)
         stackscroll = QScrollArea()
         stackscroll.setWidgetResizable(True)
         stackscroll.setFrameShape(QFrame.Shape.NoFrame)
         stackscroll.setWidget(self.stack_view)
         stackscroll.setMinimumHeight(150)
         sp.addWidget(stackscroll, 2)
-        sp.addWidget(self.diffhead)
+        sp.addWidget(headwrap)
         sp.addWidget(self.diffview, 1)
 
         self.kernel = QPlainTextEdit(); self.kernel.setReadOnly(True)
@@ -970,6 +1063,9 @@ class HoodView(QWidget):
         tp.addLayout(row)
         self.tree = FileTree()
         self.tree.file_picked.connect(self._tree_file)
+        self.tree.show_file.connect(
+            lambda path, which: self.want_version.emit(
+                str(self.treepick.currentData() or ""), path, which))
         self.tree.tree.setMinimumHeight(140)
         tp.addWidget(self.tree, 1)
 
@@ -1012,6 +1108,39 @@ class HoodView(QWidget):
             # diff pass skipped (it caps at 200) has no lines cached.
             self.want_file_diff.emit(str(tx), path)
 
+    def _open_external(self):
+        if self._shown:
+            self.want_open_external.emit(*self._shown)
+
+    def show_version(self, tx, path, which, status, text):
+        """One file, one side, in the pane under the picture."""
+        word = {"before": "as it is NOW in your folder",
+                "after": "as it WOULD BE if you press Keep"}[which]
+        self._shown = (tx, path, which) if status == "ok" else None
+        self.openext.setEnabled(status == "ok")
+        self.tabs.setCurrentIndex(0)
+        self.diffhead.setText("%s — %s   (layer %s)" % (path, word, tx))
+        if status != "ok":
+            why = {
+                "new": "This file does not exist yet. It is created by this "
+                       "transaction, so there is no 'now' version.",
+                "deleted": "This transaction deletes the file, so there is "
+                           "no 'after' version.",
+                "dir": "That is a directory, not a file.",
+                "absent": "Nothing here — the transaction may already have "
+                          "been decided.",
+            }.get(status, "Could not read it: %s" % status)
+            self.diffview.setHtml(
+                "<body style='font-family:sans-serif;color:#8b9aad;"
+                "background:#0a0e14;padding:10px'>%s</body>" % esc(why))
+            return
+        colour = "#9fb0c3" if which == "before" else "#56d364"
+        self.diffview.setHtml(
+            "<body style=\"font-family:'JetBrains Mono','DejaVu Sans Mono',"
+            "monospace;font-size:11.5px;background:#0a0e14\">"
+            "<pre style='color:%s;white-space:pre-wrap;margin:0'>%s</pre>"
+            "</body>" % (colour, esc(text)))
+
     def set_structure(self, tx, struct):
         self.tree.load(struct)
 
@@ -1039,6 +1168,8 @@ class HoodView(QWidget):
 
     def _show_tx(self, tx):
         self._open_tx = tx
+        self._shown = None
+        self.openext.setEnabled(False)
         who = self._agents.get(str(tx))
         self.diffhead.setText(
             "Layer %s%s — green is added, red is removed. None of it is in "
@@ -1953,6 +2084,9 @@ class Main(QMainWindow):
         self.hoodview.want_structure.connect(self.fetch_structure)
         self.hoodview.want_file_diff.connect(self.fetch_file_diff)
         self.hoodview.want_exec.connect(self.run_in_tx)
+        self.hoodview.want_version.connect(self.fetch_version)
+        self.hoodview.want_export.connect(self.export_version)
+        self.hoodview.want_open_external.connect(self.open_externally)
         self.stack.addWidget(self.chat)
         self.stack.addWidget(self.hoodview)
 
@@ -2088,6 +2222,90 @@ class Main(QMainWindow):
                 rc, out = res
                 self.hoodview.term.result(rc, out)
         run_async(self, TX_EXEC, GUEST, tx, cmd, then=got)
+
+    def fetch_version(self, tx, path, which):
+        """Read one side of one file, off the GUI thread."""
+        if not tx or not path:
+            return
+
+        def got(res):
+            if isinstance(res, Exception):
+                self.hoodview.show_version(tx, path, which, "error", str(res))
+            else:
+                status, text = res
+                self.hoodview.show_version(tx, path, which, status, text)
+        run_async(self, FILE_VERSION, GUEST, tx, path, which, then=got)
+
+    def open_externally(self, tx, path, which):
+        """
+        Write the shown version to a real file and hand it to the desktop.
+
+        The name carries which side it is -- notes.txt becomes
+        notes.AFTER.txt -- because the two versions end up open in the
+        same editor at the same time and nothing else in the window says
+        which is which. The extension is kept last so the editor still
+        highlights it correctly.
+        """
+        base = os.path.basename(path) or "file"
+        stem, dot, ext = base.rpartition(".")
+        tag = "NOW" if which == "before" else "AFTER"
+        name = ("%s.%s.%s" % (stem, tag, ext)) if dot else ("%s.%s" % (base, tag))
+        dest = os.path.join("/tmp", "agenttx-tx%s" % tx, name)
+
+        def got(res):
+            if isinstance(res, Exception):
+                self.hoodview.diffhead.setText("could not open it: %s" % res)
+                return
+            status, text = res
+            if status != "ok":
+                self.hoodview.diffhead.setText(
+                    "there is no '%s' version of %s" % (which, path))
+                return
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.hoodview.diffhead.setText(
+                "%s — opened %s in your editor. It is a COPY; editing it "
+                "does not change the transaction." % (path, dest))
+            try:
+                subprocess.Popen(["xdg-open", dest],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except Exception as e:
+                self.hoodview.diffhead.setText(
+                    "wrote %s but could not launch an editor: %s" % (dest, e))
+        run_async(self, FILE_VERSION, GUEST, tx, path, which, then=got)
+
+    def export_version(self, tx, which):
+        """
+        Copy one whole side out to a folder the person can open.
+
+        Two of these -- before and after -- give a pair of directories any
+        diff tool will compare, which is the thing people actually want
+        once more than two or three files have changed.
+        """
+        dest = "/tmp/agenttx-tx%s-%s" % (tx, which)
+
+        def got(res):
+            if isinstance(res, Exception):
+                self.hoodview.diffhead.setText("could not export: %s" % res)
+                return
+            n, msg = res
+            if not n:
+                self.hoodview.diffhead.setText(
+                    "nothing to export for '%s' — %s" % (which, msg))
+                return
+            self.hoodview.diffhead.setText(
+                "%d file(s) written to %s — this is a COPY; editing it does "
+                "not change the transaction" % (n, msg))
+            # Hand it to the desktop so it opens in whatever they use.
+            try:
+                subprocess.Popen(["xdg-open", msg],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+        run_async(self, EXPORT_VERSION, GUEST, tx, which, dest, then=got)
 
     def refresh_hood(self):
         if not self.hood.isChecked():

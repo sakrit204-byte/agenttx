@@ -1078,3 +1078,116 @@ def tx_exec(link: "GuestLink", tx: str, cmd: str,
     if rc == 124:
         out += "\n[stopped after %ds]" % timeout
     return rc, out
+
+
+# ======================================================================
+# One file, both ways
+# ======================================================================
+#
+# A pending change has two versions and a person deciding wants to see
+# either: what the file IS right now, and what it WOULD BE if they press
+# Keep. Both are plain files on disk and neither needs the transaction's
+# mount namespace -- overlayfs copies a whole file up on first write, so
+# upper/ holds the complete new contents, and the lower symlink points at
+# the untouched original.
+
+FILE_SH = r"""
+set -u
+TX=%(tx)s
+REL=%(rel)s
+BASE=/var/lib/agenttx/tx-$TX
+U="$BASE/upper/$REL"
+L="$(readlink "$BASE/lower" 2>/dev/null)/$REL"
+case %(which)s in
+  after)
+    if [ -c "$U" ]; then echo "---DELETED---"; exit 0; fi
+    if [ -d "$U" ]; then echo "---DIR---"; exit 0; fi
+    [ -e "$U" ] || { echo "---ABSENT---"; exit 0; }
+    head -c %(cap)d "$U"
+    ;;
+  before)
+    [ -e "$L" ] || { echo "---NEW---"; exit 0; }
+    [ -d "$L" ] && { echo "---DIR---"; exit 0; }
+    head -c %(cap)d "$L"
+    ;;
+esac
+"""
+
+
+def file_version(link: "GuestLink", tx: str, rel: str, which: str,
+                 cap: int = 200_000) -> tuple[str, str]:
+    """
+    Return (status, text) for one file of a transaction.
+
+    status is "ok", or one of the markers explaining why there is no text:
+    the file is new (no before), deleted (no after), a directory, or
+    absent. A viewer that renders an empty pane for all four tells the
+    person nothing about which of them happened.
+    """
+    if which not in ("before", "after"):
+        return "bad", ""
+    rc, so, _e = link._run_stdin(FILE_SH % {
+        "tx": shlex.quote(str(tx)),
+        "rel": shlex.quote(rel),
+        "which": which,
+        "cap": int(cap),
+    })
+    if rc != 0:
+        return "error", so
+    for marker, status in (("---DELETED---", "deleted"), ("---NEW---", "new"),
+                           ("---DIR---", "dir"), ("---ABSENT---", "absent")):
+        if so.startswith(marker):
+            return status, ""
+    return "ok", so
+
+
+EXPORT_SH = r"""
+set -u
+TX=%(tx)s
+BASE=/var/lib/agenttx/tx-$TX
+U="$BASE/upper"
+L="$(readlink "$BASE/lower" 2>/dev/null)"
+OUT=$(mktemp -d)
+cd "$U" 2>/dev/null || { echo NOUPPER >&2; exit 1; }
+# Walk the CHANGED set and take each file from whichever side was asked
+# for. Exporting the whole lower tree instead would bury twenty changed
+# files in two thousand untouched ones.
+find . -mindepth 1 \( -type f -o -type c \) | sed 's|^\./||' | \
+while read -r rel; do
+  case %(which)s in
+    after)  [ -c "$U/$rel" ] && continue      # whiteout: deleted, no after
+            mkdir -p "$OUT/$(dirname "$rel")"; cp -a "$U/$rel" "$OUT/$rel" ;;
+    before) [ -e "$L/$rel" ] || continue      # created: no before
+            mkdir -p "$OUT/$(dirname "$rel")"; cp -a "$L/$rel" "$OUT/$rel" ;;
+  esac
+done
+tar -C "$OUT" -cz . | base64 -w0
+rm -rf "$OUT"
+"""
+
+
+def export_version(link: "GuestLink", tx: str, which: str,
+                   dest: str) -> tuple[int, str]:
+    """
+    Copy one side of a transaction's changed files to `dest` on the host.
+
+    Returns (file count, message). Two of these -- before and after --
+    give you a pair of directories any diff tool can open.
+    """
+    import base64 as _b64
+    import os as _os
+    import subprocess as _sp
+
+    if which not in ("before", "after"):
+        return 0, "which must be before or after"
+    rc, so, se = link._run_stdin(EXPORT_SH % {"tx": shlex.quote(str(tx)),
+                                              "which": which})
+    if rc != 0 or not so.strip():
+        return 0, (se.strip() or "nothing to export")
+    _os.makedirs(dest, exist_ok=True)
+    p = _sp.run(["tar", "-C", dest, "-xz"],
+                input=_b64.b64decode(so.strip()), capture_output=True)
+    if p.returncode != 0:
+        return 0, p.stderr.decode()[:200]
+    n = sum(len(f) for _r, _d, f in _os.walk(dest))
+    return n, dest
