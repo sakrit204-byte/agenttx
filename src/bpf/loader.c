@@ -397,6 +397,7 @@ int main(int argc, char **argv)
 	int once = 0, stats = 0, err, i, do_pin = 0, do_unpin = 0;
 	const char *jpath = NULL, *mpath = NULL;
 	int defer_ports[16], n_defer = 0;
+	int infra_ports[16], n_infra = 0;
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--once"))        once = 1;
@@ -408,10 +409,13 @@ int main(int argc, char **argv)
 		else if (!strcmp(argv[i], "--unpin")) do_unpin = 1;
 		else if (!strcmp(argv[i], "--defer-port") && i + 1 < argc &&
 			 n_defer < 16) defer_ports[n_defer++] = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--infra-port") && i + 1 < argc &&
+			 n_infra < 16) infra_ports[n_infra++] = atoi(argv[++i]);
 		else {
 			fprintf(stderr,
 				"usage: txload [--once] [--stats] [--jsonl F]\n"
 				"              [--model FILE] [--defer-port N]...\n"
+				"              [--infra-port N]...  never an effect\n"
 				"              [--pin]    keep the hooks attached after exit\n"
 				"              [--unpin]  detach pinned hooks and quit\n");
 			return 2;
@@ -551,6 +555,36 @@ int main(int argc, char **argv)
 		       m.hdr.accuracy_pct / 100, m.hdr.accuracy_pct % 100);
 	} else {
 		printf("txload: no model (--model) -- using the static rule table\n");
+	}
+
+	/*
+	 * Ports that are INFRASTRUCTURE, not effects.
+	 *
+	 * The agent's own reasoning travels over the network like anything
+	 * else, and the hooks cannot tell a model call from a side effect:
+	 * both are TCP from a process inside a transaction. So the sandbox
+	 * deferred the agent's call to its own model, the request never
+	 * arrived, and the turn died with "Connection timed out" -- the
+	 * agent could not think inside its own sandbox.
+	 *
+	 * This is not a special case for one tool. Any transactional agent
+	 * sandbox has to exempt the channel the agent reasons over, because
+	 * that traffic is not something the agent DID, it is how the agent
+	 * decides what to do. Deferring it until commit is a deadlock by
+	 * construction: the commit waits for the agent and the agent waits
+	 * for the commit.
+	 *
+	 * Marked REVERSIBLE, the same class as loopback, for the same
+	 * reason: it is not an outbound effect of the transaction at all.
+	 */
+	for (i = 0; i < n_infra; i++) {
+		__u32 k = (__u32)infra_ports[i];
+		__u8 v = TX_REVERSIBLE;
+
+		if (bpf_map_update_elem(bpf_map__fd(skel->maps.tx_rules),
+					&k, &v, BPF_ANY) == 0)
+			printf("txload: rule -- port %d is INFRASTRUCTURE "
+			       "(never deferred)\n", infra_ports[i]);
 	}
 
 	/* Operator overrides for the static rule table (P3-06). */

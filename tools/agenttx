@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0
+"""
+agenttx --- one command for the whole thing.
+
+Everything here was already possible; it was just spread across a Makefile,
+a desktop app and a lot of `python3 -c` with sys.path edits. That is fine
+while you are building it and useless when you want to use it.
+
+    agenttx                      open the desktop app
+    agenttx up                   boot the sandbox and load everything
+    agenttx status               what is running right now
+    agenttx task "..."           give the agent a task
+    agenttx sh "..."             run one shell command (no model, no cost)
+    agenttx layers               live transactions and the wait-for graph
+    agenttx try TX "..."         run something inside a pending transaction
+    agenttx keep TX | drop TX    decide
+    agenttx demo                 put a real git checkout in the sandbox
+    agenttx login                sign the sandbox agent in
+    agenttx test                 run the test suites
+    agenttx down                 stop everything
+
+Run `agenttx <command> -h` for the options each one takes.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO, "tools", "ui"))
+
+from guest import (AgentThreads, GuestLink,   # noqa: E402
+                   structure as structure_of, tx_exec)
+
+G = GuestLink()
+T = AgentThreads(G)
+
+C_OK, C_BAD, C_DIM, C_OFF = "\033[32m", "\033[31m", "\033[2m", "\033[0m"
+if not sys.stdout.isatty():
+    C_OK = C_BAD = C_DIM = C_OFF = ""
+
+
+def say(*a):
+    print(*a, flush=True)
+
+
+def need_guest():
+    if not G.alive():
+        say("%sthe sandbox is not reachable%s — try: agenttx up"
+            % (C_BAD, C_OFF))
+        raise SystemExit(1)
+
+
+# ---------------------------------------------------------------- up/down
+def cmd_up(a):
+    if G.alive():
+        say("sandbox already up")
+    else:
+        say("booting the guest…")
+        env = dict(os.environ)
+        env.setdefault("KBUILD_OUT", os.path.expanduser("~/build/linux-perf"))
+        env.setdefault("SERIAL_LOG", "/tmp/agenttx-vm.log")
+        subprocess.Popen(["bash", os.path.join(REPO, "tools/vm/run-vm.sh")],
+                         env=env, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        for _ in range(60):
+            if G.alive():
+                break
+            time.sleep(2)
+        if not G.alive():
+            say("%sthe guest did not come up%s — see /tmp/agenttx-vm.log"
+                % (C_BAD, C_OFF))
+            raise SystemExit(1)
+
+    G.deploy()
+    # Each step is independently safe to repeat, so `up` doubles as
+    # "put it back the way it should be" after something was killed.
+    G.run("lsmod | grep -q '^agenttx' || insmod /mnt/agenttx/agenttx.ko", timeout=60)
+    G.run("mountpoint -q /sys/kernel/debug || mount -t debugfs none /sys/kernel/debug",
+          timeout=30)
+    # --infra-port 11434: the agent's channel to its model is how it
+    # decides what to do, not something it did. Without this the sandbox
+    # defers the agent's own model call and the turn dies with a
+    # connection timeout -- see the comment in src/bpf/loader.c.
+    G.run("pgrep -x txload >/dev/null || "
+          "(setsid /usr/local/bin/txload --pin --infra-port 11434 "
+          ">/var/log/txload.log 2>&1 &)", timeout=60)
+    time.sleep(2)
+    cmd_status(a)
+
+
+def cmd_down(a):
+    if G.alive():
+        say("ending open transactions…")
+        G.run("for d in /run/agenttx/session-*; do "
+              "[ -d \"$d\" ] && printf abort > \"$d/decide\"; done", timeout=60)
+        time.sleep(3)
+        G.run("for p in $(pgrep -x txctl); do kill -9 $p; done", timeout=30)
+        G.run("nohup poweroff >/dev/null 2>&1 &", timeout=15)
+    subprocess.run(["pkill", "-f", "qemu-system-x86_64"], check=False)
+    say("sandbox stopped")
+
+
+def cmd_status(a):
+    if not G.alive():
+        say("sandbox   %soffline%s  (agenttx up)" % (C_BAD, C_OFF))
+        return
+    s = G.snapshot()
+    m, b = s.get("module", {}), s.get("bpf", {})
+
+    def mark(v):
+        return ("%syes%s" % (C_OK, C_OFF)) if v else ("%sno%s" % (C_BAD, C_OFF))
+
+    say("sandbox   %sonline%s" % (C_OK, C_OFF))
+    say("  module          %s   providers: %s" % (mark(m.get("loaded")),
+                                                  s.get("mode", "?")))
+    say("  BPF LSM         %s   WAL streaming: %s"
+        % (mark(b.get("lsm")), mark(b.get("running"))))
+    say("  brain           %s" % (s.get("brain") or "none"))
+    say("  open layers     %s   sandboxed writes: %s"
+        % (s.get("open_tx", 0), s.get("upper_files", 0)))
+    say("  wait-for edges  %s   deadlocks broken: %s"
+        % (s.get("wfg_edges", 0), s.get("deadlocks", 0)))
+    if s.get("health"):
+        say("  %skernel warnings in dmesg: %s%s" % (C_BAD, s["health"], C_OFF))
+    waiting = [x for x in G.sessions() if x.get("status") == "awaiting-decision"]
+    for w in waiting:
+        say("  %swaiting on you%s: tx %s  (%s file(s))  — agenttx keep %s"
+            % (C_OK, C_OFF, w.get("tx"), w.get("changed", "?"), w.get("tx")))
+
+
+# ---------------------------------------------------------------- running
+def _stream(thread, since=0, quiet=False):
+    """Follow a turn's transcript until it ends. Returns the last tx id."""
+    seen_end, tx = False, None
+    while not seen_end:
+        evs, since = T.events(thread, since)
+        for e in evs:
+            k, who = e.get("type"), e.get("agent") or ""
+            tag = ("[%s] " % who) if who else ""
+            if k == "assistant":
+                for c in e["message"]["content"]:
+                    if c.get("type") == "tool_use":
+                        arg = json.dumps(c.get("input") or {})
+                        say("  %s%s%s %s %s" % (C_DIM, tag, C_OFF,
+                                                c["name"], arg[:90]))
+                    elif c.get("text", "").strip():
+                        say("  %s%s" % (tag, c["text"].strip()[:400]))
+            elif k == "user" and not quiet:
+                for c in e["message"]["content"]:
+                    if c.get("type") == "tool_result":
+                        body = str(c.get("content") or "").strip().replace("\n", " ")
+                        mark = C_BAD if c.get("is_error") else C_DIM
+                        say("      %s-> %s%s" % (mark, body[:110], C_OFF))
+            elif k in ("tx_notice", "tx_error"):
+                say("  %s%s%s" % (C_BAD if k == "tx_error" else C_DIM,
+                                  (e.get("text") or "")[:400], C_OFF))
+            elif k == "tx_output":
+                say((e.get("text") or "").rstrip())
+            elif k == "swarm_plan":
+                for p in e.get("parts", []):
+                    say("  %splan%s %s: %s" % (C_DIM, C_OFF, p["name"],
+                                               p["task"][:80]))
+            elif k == "tx_wait_edge":
+                say("  %swait%s tx%s -> tx%s (%s)"
+                    % (C_DIM, C_OFF, e["waiter"], e["holder"], e["resource"]))
+            elif k == "result":
+                say("  %sfinished — %s step(s), %.1fs%s"
+                    % (C_DIM, e.get("num_turns"),
+                       (e.get("duration_ms") or 0) / 1000.0, C_OFF))
+            elif k == "tx_turn_end":
+                seen_end = True
+        if not seen_end:
+            time.sleep(1)
+    for s in G.sessions():
+        if s.get("status") == "awaiting-decision":
+            tx = s.get("tx")
+    return tx
+
+
+def _run(a, shell):
+    need_guest()
+    thread = a.thread or ("cli-%d" % int(time.time()))
+    text = " ".join(a.text)
+    if shell:
+        T.start_shell(thread, a.folder, text, text[:60])
+    else:
+        mode = "swarm" if a.agents > 1 else ("claude" if a.claude else "local")
+        T.start_turn(thread, a.folder, text, text[:60], str(uuid.uuid4()),
+                     "agent", mode, a.agents, a.model)
+    say("%s· %s in %s%s" % (C_DIM, thread, a.folder, C_OFF))
+    tx = _stream(thread)
+    _after(tx)
+
+
+def _after(tx):
+    if not tx:
+        return
+    diff = G.session_diff(tx)
+    if isinstance(diff, Exception) or not diff:
+        say("\nnothing changed.")
+        return
+    say("")
+    for d in diff[:25]:
+        say("  %-9s %s (+%s −%s)" % (d.get("kind"), d.get("path"),
+                                     d.get("added", 0), d.get("removed", 0)))
+    say("\n%snothing above has touched your folder yet%s"
+        % (C_DIM, C_OFF))
+    say("  try it :  agenttx try %s \"<command>\"" % tx)
+    say("  keep   :  agenttx keep %s" % tx)
+    say("  discard:  agenttx drop %s" % tx)
+
+
+def cmd_task(a):
+    _run(a, shell=False)
+
+
+def cmd_sh(a):
+    _run(a, shell=True)
+
+
+# ---------------------------------------------------------------- inspect
+def cmd_layers(a):
+    need_guest()
+    s = G.snapshot()
+    live = s.get("txlive") or []
+    if not live:
+        say("no transaction is open.")
+        return
+    say("%-5s %-11s %-12s %s" % ("tx", "state", "worst", "files changed"))
+    for t in live:
+        st = structure_of(G, t["tx"])
+        n = len(st.get("changed") or [])
+        say("%-5s %-11s %-12s %s" % (t["tx"], t["state"], t["worst"], n))
+        for c in (st.get("changed") or [])[:6]:
+            say("      %-9s %s" % (c["kind"], c["path"]))
+        if n > 6:
+            say("      … and %d more   (agenttx tree %s)" % (n - 6, t["tx"]))
+    edges = s.get("wfg") or []
+    if edges:
+        say("\nwait-for graph:")
+        for e in edges:
+            say("  tx %s waits on tx %s  (%s, %sms)"
+                % (e["waiter"], e["holder"], e["kind"], e["age_ms"]))
+        say("  %sa cycle here is a deadlock; the kernel breaks it on"
+            " insert%s" % (C_DIM, C_OFF))
+
+
+def cmd_tree(a):
+    need_guest()
+    st = structure_of(G, a.tx)
+    changed = {c["path"]: c for c in st.get("changed") or []}
+    if not changed:
+        say("layer %s has changed nothing." % a.tx)
+        return
+    say("%d changed, %d untouched, under %s"
+        % (len(changed), len(st.get("untouched") or []), st.get("lower")))
+    for p in sorted(changed):
+        say("  %-9s %s" % (changed[p]["kind"], p))
+
+
+def cmd_try(a):
+    need_guest()
+    rc, out = tx_exec(G, a.tx, " ".join(a.text), timeout=a.timeout)
+    if out.strip():
+        say(out.rstrip())
+    if rc == 7:
+        say("%sthat transaction is no longer open%s" % (C_BAD, C_OFF))
+    elif rc:
+        say("%s[exit %s]%s" % (C_DIM, rc, C_OFF))
+
+
+def _decide(tx, what):
+    need_guest()
+    if G.session_decide(tx, what):
+        say("%s — applying. The folder is %s."
+            % ("kept" if what == "commit" else "discarded",
+               "updated" if what == "commit" else "exactly as it was"))
+    else:
+        say("%scould not reach that transaction%s" % (C_BAD, C_OFF))
+
+
+def cmd_keep(a):
+    _decide(a.tx, "commit")
+
+
+def cmd_drop(a):
+    _decide(a.tx, "abort")
+
+
+# ---------------------------------------------------------------- setup
+def cmd_demo(a):
+    need_guest()
+    say("cloning %s into %s …" % (a.url, a.folder))
+    rc, out, err = G.run("bash /mnt/agenttx/tools/demo/setup-repo.sh %s %s"
+                         % (a.url, a.folder), timeout=600)
+    say(out or err)
+
+
+def cmd_login(a):
+    need_guest()
+    say("Run this, then follow the URL it prints:\n")
+    say("  sshpass -p agenttx ssh -p 2222 -o StrictHostKeyChecking=no \\")
+    say("      root@127.0.0.1 -t 'su - agent -c \"claude setup-token\"'\n")
+    say("It needs your browser and your account, so it cannot be done for")
+    say("you. It signs in on your SUBSCRIPTION — no API key, no billing.")
+    out = G.run("ls /home/agent/.claude/.credentials.json 2>/dev/null && "
+                "echo SIGNED-IN || echo not-signed-in", timeout=30)[1]
+    say("\ncurrently: %s" % out.strip().splitlines()[-1])
+
+
+def cmd_app(a):
+    os.execvp("python3", ["python3",
+                          os.path.join(REPO, "tools/app/agenttx_desktop.py")])
+
+
+def cmd_test(a):
+    say("--- host ---")
+    subprocess.run(["bash", os.path.join(REPO, "tests/run.sh")], cwd=REPO)
+    if not G.alive():
+        return
+
+    # The P3 tests attach their OWN BPF programs, and a loader pinned by
+    # `agenttx up` is a second tcx/egress program on the same interface.
+    # Both run; the test registers its flow in its own map and the other
+    # program lets the packet through, so "egress actually dropped
+    # packets" fails with counter 0 and reads like a broken suppression
+    # path. The tests need the layer to themselves.
+    was_running = "yes" in G.run(
+        "pgrep -x txload >/dev/null && echo yes || echo no", timeout=30)[1]
+    if was_running:
+        say("%s(stopping the pinned BPF loader so the tests own the "
+            "layer)%s" % (C_DIM, C_OFF))
+        G.run("/usr/local/bin/txload --unpin >/dev/null 2>&1; "
+              "for p in $(pgrep -x txload); do kill $p; done; sleep 2",
+              timeout=90)
+
+    say("\n--- guest ---")
+    say(G.run("cd /mnt/agenttx && bash tests/run.sh 2>&1 | tail -20",
+              timeout=900)[1])
+
+    if was_running:
+        G.run("setsid /usr/local/bin/txload --pin --infra-port 11434 "
+              ">/var/log/txload.log 2>&1 &", timeout=60)
+        say("%s(BPF loader restarted)%s" % (C_DIM, C_OFF))
+
+
+# ---------------------------------------------------------------- argv
+def main():
+    p = argparse.ArgumentParser(
+        prog="agenttx", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd")
+
+    def add(name, fn, help_):
+        q = sub.add_parser(name, help=help_)
+        q.set_defaults(fn=fn)
+        return q
+
+    add("up", cmd_up, "boot the sandbox and load everything")
+    add("down", cmd_down, "stop everything")
+    add("status", cmd_status, "what is running right now")
+    add("app", cmd_app, "open the desktop app")
+    add("layers", cmd_layers, "live transactions and the wait-for graph")
+    add("login", cmd_login, "sign the sandbox agent in")
+    add("test", cmd_test, "run the test suites")
+
+    for name, fn, h in (("task", cmd_task, "give the agent a task"),
+                        ("sh", cmd_sh, "run one shell command, no model")):
+        q = add(name, fn, h)
+        q.add_argument("text", nargs="+")
+        q.add_argument("--folder", "-f", default="/tmp/work",
+                       help="the only folder it may change")
+        q.add_argument("--thread", "-t", help="continue an existing task")
+        if name == "task":
+            q.add_argument("--agents", "-n", type=int, default=1,
+                           help="run N agents at once, one transaction each")
+            q.add_argument("--claude", action="store_true",
+                           help="use Claude Code on your subscription")
+            q.add_argument("--model", "-m", help="override the local model")
+
+    q = add("try", cmd_try, "run something inside a pending transaction")
+    q.add_argument("tx")
+    q.add_argument("text", nargs="+")
+    q.add_argument("--timeout", type=int, default=60)
+
+    q = add("tree", cmd_tree, "the file structure of one layer")
+    q.add_argument("tx")
+
+    for name, fn, h in (("keep", cmd_keep, "commit a transaction"),
+                        ("drop", cmd_drop, "discard a transaction")):
+        q = add(name, fn, h)
+        q.add_argument("tx")
+
+    q = add("demo", cmd_demo, "put a real git checkout in the sandbox")
+    q.add_argument("--url", default="https://github.com/pallets/flask")
+    q.add_argument("--folder", "-f", default="/tmp/repo")
+
+    a = p.parse_args()
+    if not a.cmd:
+        return cmd_app(a)          # bare `agenttx` still opens the app
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        say("\ninterrupted — any open transaction is still open "
+            "(agenttx status)")
