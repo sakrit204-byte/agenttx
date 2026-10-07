@@ -106,6 +106,39 @@ who=$(exec_in_tx 'whoami' | tr -d '[:space:]')
 	&& ok "the try-it shell runs as the agent, not root" \
 	|| bad "try-it ran as '$who', not the agent"
 
+# --- 4b. the upper layer is readable WITHOUT the namespace ---------------
+# This is what `agenttx cat` and `agenttx open` rely on: overlayfs copies a
+# whole file up on first write, so every file the agent created or changed
+# is a plain file under tx-N/upper holding its full new contents. An editor
+# on the host cannot enter the mount namespace; it can read this.
+U=/var/lib/agenttx/tx-$TX/upper
+if [[ -f "$U/calc.py" ]]; then
+	ok "the changed file is a plain file in the upper layer"
+else
+	bad "the upper layer does not hold the changed file"
+fi
+if grep -q 'return a \* b' "$U/calc.py" 2>/dev/null; then
+	ok "the upper layer holds the NEW contents, not a fragment"
+else
+	bad "the upper layer does not hold the agent's version"
+fi
+
+# --- 4c. writing through the namespace changes the transaction -----------
+# What `agenttx push` does. Deliberately NOT a write straight into upper/:
+# modifying a mounted overlay's upper directory behind its back is
+# undefined, so this goes through the merged view like the agent does.
+exec_in_tx 'printf "# edited by the human\n" >> calc.py' >/dev/null 2>&1
+if grep -q 'edited by the human' "$U/calc.py" 2>/dev/null; then
+	ok "an edit made through the transaction lands in its layer"
+else
+	bad "an edit through the transaction did not reach the layer"
+fi
+if grep -q 'edited by the human' "$WORK/calc.py" 2>/dev/null; then
+	bad "that edit escaped into the real folder"
+else
+	ok "and it did not touch the real folder"
+fi
+
 # --- 5. a transaction that is gone cannot be entered ----------------------
 printf abort > "$DIR/decide"
 for _ in $(seq 1 60); do

@@ -13,6 +13,8 @@ while you are building it and useless when you want to use it.
     agenttx task "..."           give the agent a task
     agenttx sh "..."             run one shell command (no model, no cost)
     agenttx layers               live transactions and the wait-for graph
+    agenttx cat TX FILE          read a file as it would be after commit
+    agenttx open TX              copy the changed files out for your editor
     agenttx try TX "..."         run something inside a pending transaction
     agenttx keep TX | drop TX    decide
     agenttx demo                 put a real git checkout in the sandbox
@@ -276,6 +278,94 @@ def cmd_try(a):
         say("%s[exit %s]%s" % (C_DIM, rc, C_OFF))
 
 
+# ------------------------------------------------------ look at the files
+#
+# The merged view lives in the transaction's private mount namespace, so
+# no editor on the host can see it. The UPPER LAYER can: overlayfs copies
+# a whole file up on first write, so every file the agent created or
+# changed is a plain file under /var/lib/agenttx/tx-N/upper with its full
+# new contents. That is what these read.
+
+def _upper(tx):
+    return "/var/lib/agenttx/tx-%s/upper" % tx
+
+
+def cmd_cat(a):
+    need_guest()
+    rc, out, err = G.run("cat %s/%s 2>&1" % (_upper(a.tx), a.path), timeout=60)
+    if rc != 0 and "No such file" in (out + err):
+        say("%s is not among the files this transaction changed." % a.path)
+        say("%s(agenttx tree %s lists what is)%s" % (C_DIM, a.tx, C_OFF))
+        raise SystemExit(1)
+    sys.stdout.write(out)
+
+
+def cmd_open(a):
+    """Copy the changed files out where an editor can open them."""
+    need_guest()
+    dest = a.to or ("/tmp/agenttx-tx%s" % a.tx)
+    os.makedirs(dest, exist_ok=True)
+    rc, b64, err = G.run("tar -C %s -cz . 2>/dev/null | base64 -w0"
+                         % _upper(a.tx), timeout=120)
+    if rc != 0 or not b64.strip():
+        say("nothing to open — transaction %s has changed no files." % a.tx)
+        raise SystemExit(1)
+    import base64 as _b64
+    tar = _b64.b64decode(b64.strip())
+    p = subprocess.run(["tar", "-C", dest, "-xz"], input=tar,
+                       capture_output=True)
+    if p.returncode != 0:
+        say("%scould not unpack: %s%s"
+            % (C_BAD, p.stderr.decode()[:200], C_OFF))
+        raise SystemExit(1)
+
+    files = []
+    for root, _d, fs in os.walk(dest):
+        for f in fs:
+            files.append(os.path.relpath(os.path.join(root, f), dest))
+    say("%d file(s) from transaction %s are in:\n  %s\n"
+        % (len(files), a.tx, dest))
+    for f in sorted(files)[:40]:
+        say("  %s" % f)
+
+    # Say plainly that this is a COPY. Somebody who edits here expecting
+    # the transaction to change would otherwise press Keep and get the
+    # agent's version, not theirs, with no indication anything was lost.
+    say("\n%sThis is a COPY, for reading. Editing it does not change the"
+        % C_DIM)
+    say("transaction. If you do edit and want those edits kept:%s" % C_OFF)
+    say("  agenttx push %s %s" % (a.tx, dest))
+
+
+def cmd_push(a):
+    """Write edits from the exported copy back into the transaction."""
+    need_guest()
+    if not os.path.isdir(a.dir):
+        say("%s is not a directory" % a.dir)
+        raise SystemExit(1)
+    tar = subprocess.run(["tar", "-C", a.dir, "-cz", "."],
+                         capture_output=True).stdout
+    if len(tar) > 6 * 1024 * 1024:
+        say("%sthat is %.1f MB; push it in smaller pieces%s"
+            % (C_BAD, len(tar) / 1e6, C_OFF))
+        raise SystemExit(1)
+    import base64 as _b64
+    blob = _b64.b64encode(tar).decode()
+    # Written THROUGH the merged view, inside the transaction's namespace,
+    # rather than straight into the upper layer. Modifying a mounted
+    # overlay's upper directory behind its back is explicitly undefined;
+    # going through the mount is the supported path and is what the agent
+    # itself does.
+    rc, out = tx_exec(G, a.tx,
+                      "echo %s | base64 -d | tar -xz -C ." % blob, timeout=120)
+    if rc == 0:
+        say("pushed %s into transaction %s." % (a.dir, a.tx))
+        say("%scheck it with: agenttx tree %s%s" % (C_DIM, a.tx, C_OFF))
+    else:
+        say("%spush failed%s: %s" % (C_BAD, C_OFF, out.strip()[:300]))
+        raise SystemExit(1)
+
+
 def _decide(tx, what):
     need_guest()
     if G.session_decide(tx, what):
@@ -392,6 +482,18 @@ def main():
 
     q = add("tree", cmd_tree, "the file structure of one layer")
     q.add_argument("tx")
+
+    q = add("cat", cmd_cat, "show one file as it would be after commit")
+    q.add_argument("tx")
+    q.add_argument("path")
+
+    q = add("open", cmd_open, "copy the changed files out for your editor")
+    q.add_argument("tx")
+    q.add_argument("--to", help="where to put them (default /tmp/agenttx-txN)")
+
+    q = add("push", cmd_push, "write edits from that copy back in")
+    q.add_argument("tx")
+    q.add_argument("dir")
 
     for name, fn, h in (("keep", cmd_keep, "commit a transaction"),
                         ("drop", cmd_drop, "discard a transaction")):
