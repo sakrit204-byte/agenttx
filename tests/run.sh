@@ -98,6 +98,7 @@ run_test 0 tests/p4/t07_infer.sh
 run_test 0 tests/p4/t08_deadlock.sh
 run_test 0 tests/p4/t10_agent_tools.sh
 run_test 0 tests/p4/t11_loop.sh
+run_test 0 tests/p4/t13_providers.sh
 
 # --- tier 1: module loaded in the guest -------------------------------
 echo
