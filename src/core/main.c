@@ -114,10 +114,16 @@ static int __init agenttx_init(void)
 		goto err_ctx;
 	}
 
+	ret = tx_occ_init();
+	if (ret) {
+		pr_err("commit validation init failed: %d\n", ret);
+		goto err_waitfor;
+	}
+
 	ret = misc_register(&agenttx_misc);
 	if (ret) {
 		pr_err("misc_register failed: %d\n", ret);
-		goto err_ctx;
+		goto err_occ;
 	}
 	misc_registered = true;
 
@@ -169,6 +175,9 @@ static int __init agenttx_init(void)
 err_misc:
 	misc_deregister(&agenttx_misc);
 	misc_registered = false;
+err_occ:
+	tx_occ_exit();
+err_waitfor:
 	tx_waitfor_exit();
 err_ctx:
 	tx_ctx_exit();
@@ -210,6 +219,7 @@ static void __exit agenttx_exit(void)
 	 * so draining it first means tx_ctx_exit() sees a settled table rather
 	 * than one being mutated underneath it.
 	 */
+	tx_occ_exit();
 	tx_waitfor_exit();
 	tx_ctx_exit();
 	pr_info("unloaded\n");

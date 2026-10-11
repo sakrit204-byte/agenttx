@@ -77,7 +77,48 @@ struct tx_ctx {
 
 	s64			deadline_ns;	/* -1 when there is none        */
 	u32			supervisor_pid;	/* 0 until one registers        */
+
+	/*
+	 * The commit sequence this transaction started from (P2-12). Any
+	 * path committed at a LATER sequence than this is a write we did
+	 * not see, so building on it is a stale read. Immutable after
+	 * create, so it needs no lock.
+	 */
+	u64			begin_seq;
 };
+
+/* ---------------------------------------------------------------- */
+/* occ.c  (P2-12) --- commit-time validation                         */
+/* ---------------------------------------------------------------- */
+
+int  tx_occ_init(void);
+void tx_occ_exit(void);
+
+/*
+ * Returns 0 if this transaction may commit, or -EBUSY if some other
+ * transaction committed a path in its write set after it began. The
+ * caller must not merge anything when this refuses.
+ */
+int  tx_occ_validate(struct tx_ctx *ctx);
+
+/*
+ * Capture the write set BEFORE the merge and publish it after.
+ * tx_fs_commit() empties the upper layer, so a walk performed after it
+ * finds nothing: the snapshot has to be taken while the layer is still
+ * there, and recorded only once the merge has actually succeeded.
+ */
+struct occ_set;
+int  tx_occ_snapshot(struct tx_ctx *ctx, struct occ_set **out);
+void tx_occ_publish_set(struct tx_ctx *ctx, struct occ_set *set);
+void tx_occ_set_free(struct occ_set *set);
+
+u64  tx_occ_seq_now(void);
+bool tx_occ_enforcing(void);
+void tx_occ_stats(u64 *validated, u64 *refused, u64 *tracked);
+
+/* Walk a transaction's write set by relative path.  Provided by fs. */
+typedef int (*tx_fs_path_fn)(const char *rel, void *arg);
+int  tx_fs_writeset_each(tx_id_t tx_id, tx_fs_path_fn fn, void *arg);
 
 /* ---------------------------------------------------------------- */
 /* ctx.c  (P1-05)                                                    */

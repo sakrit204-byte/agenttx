@@ -160,6 +160,13 @@ int tx_ctx_create(u32 tgid, u32 owner_pid, u32 flags, u32 timeout_ms,
 	ctx->owner_pid	= owner_pid;
 	ctx->flags	= flags;
 	ctx->state	= TX_STATE_NONE;
+	/*
+	 * Stamp the commit sequence we are starting from. Everything
+	 * committed up to here is state this transaction is entitled to
+	 * build on; anything committed after it is a write we never saw.
+	 * (P2-12)
+	 */
+	ctx->begin_seq	= tx_occ_seq_now();
 	ctx->worst_class = TX_REVERSIBLE;
 	ctx->deadline_ns = timeout_ms
 			 ? (s64)ktime_get_ns() + (s64)timeout_ms * NSEC_PER_MSEC

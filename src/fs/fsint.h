@@ -72,4 +72,12 @@ int  tx_fs_rm_contents(struct path *dir, int depth, u64 *removed);
 /* Count entries below @dir, recursively. */
 int  tx_fs_count(struct path *dir, int depth, u64 *n);
 
+/*
+ * Visit every file in a transaction's write set, by path relative to the
+ * upper layer. Returning non-zero from @fn stops the walk and is passed
+ * back to the caller. Used by OCC validation (P2-12).
+ */
+typedef int (*tx_fs_path_fn)(const char *rel, void *arg);
+int  tx_fs_writeset_each(tx_id_t tx_id, tx_fs_path_fn fn, void *arg);
+
 #endif /* _AGENTTX_FS_INT_H */

@@ -67,12 +67,45 @@ static int tx_transition(struct tx_ctx *ctx, enum tx_state to)
 
 int tx_do_commit(struct tx_ctx *ctx, u32 reason, u64 *n_effects, u64 *n_files)
 {
+	struct occ_set *wset = NULL;
 	u64 files = 0, effects = 0;
 	int fs_ret, eff_ret, ret;
 	bool was_doomed;
 
 	spin_lock(&ctx->lock);
 	was_doomed = (ctx->state == TX_STATE_DOOMED);
+	spin_unlock(&ctx->lock);
+
+	/*
+	 * P2-12, the validate phase of optimistic concurrency control.
+	 *
+	 * This runs BEFORE the move to COMMITTING, and that placement is
+	 * forced: the state machine allows COMMITTING -> DONE | FAILED and
+	 * nothing else, so a transaction refused after entering COMMITTING
+	 * would have no legal way back. Validating first leaves a refused
+	 * transaction ACTIVE, which is the truthful description of it --
+	 * it still holds its layer, and it can be retried or aborted.
+	 *
+	 * A DOOMED transaction is exempt, and not because the conflict
+	 * matters less. COMMITTING is the only exit DOOMED has; refusing
+	 * would strand it in a state with no way out, which is a worse
+	 * failure than the overwrite. We log it at error level instead.
+	 */
+	if (was_doomed) {
+		ret = tx_occ_validate(ctx);
+		if (ret)
+			pr_err("tx=%llu: conflict found but this transaction is DOOMED and commit is its only exit; merging anyway and an earlier write will be lost\n",
+			       (unsigned long long)ctx->tx_id);
+	} else {
+		ret = tx_occ_validate(ctx);
+		if (ret) {
+			pr_warn("tx=%llu: commit REFUSED by conflict validation; nothing merged, nothing emitted, the layer is intact\n",
+				(unsigned long long)ctx->tx_id);
+			return ret;
+		}
+	}
+
+	spin_lock(&ctx->lock);
 	ret = tx_state_set(ctx, TX_STATE_COMMITTING);
 	spin_unlock(&ctx->lock);
 	if (ret)
@@ -92,7 +125,17 @@ int tx_do_commit(struct tx_ctx *ctx, u32 reason, u64 *n_effects, u64 *n_files)
 	 * concurrent edit is the kind of thing that must never be invisible.
 	 */
 	if (tx_fs_extmod_check(ctx->tx_id) > 0)
-		pr_warn("tx=%llu: the lower layer changed during this transaction; committing anyway\n",
+		pr_warn("tx=%llu: the lower layer changed during this transaction\n",
+			(unsigned long long)ctx->tx_id);
+
+	/*
+	 * Snapshot the write set while the upper layer still exists; the
+	 * merge below empties it. A failure here is not fatal to the
+	 * commit, but it does mean a later transaction will not see these
+	 * paths, so it is said out loud rather than swallowed.
+	 */
+	if (tx_occ_snapshot(ctx, &wset))
+		pr_warn("tx=%llu: could not capture the write set; later transactions may not see this commit\n",
 			(unsigned long long)ctx->tx_id);
 
 	/* ---- phase 1: the undoable half ---- */
@@ -109,6 +152,13 @@ int tx_do_commit(struct tx_ctx *ctx, u32 reason, u64 *n_effects, u64 *n_files)
 		tx_transition(ctx, TX_STATE_FAILED);
 		goto out;
 	}
+
+	/*
+	 * The merge succeeded, so these paths are now part of the shared
+	 * tree. Record them before anything else can commit, so the next
+	 * transaction to validate sees this write.
+	 */
+	tx_occ_publish_set(ctx, wset);
 
 	/* ---- phase 2: the point of no return ---- */
 	eff_ret = tx_eff_flush(ctx->tx_id, &effects);
@@ -135,6 +185,7 @@ int tx_do_commit(struct tx_ctx *ctx, u32 reason, u64 *n_effects, u64 *n_files)
 		(unsigned long long)files, (unsigned long long)effects);
 
 out:
+	tx_occ_set_free(wset);
 	spin_lock(&ctx->lock);
 	ctx->n_written  = files;
 	ctx->n_deferred = 0;

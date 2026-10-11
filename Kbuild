@@ -27,6 +27,7 @@ agenttx-y += src/core/commit.o
 agenttx-y += src/core/exit.o
 agenttx-y += src/core/waitfor.o
 agenttx-y += src/core/wfdebug.o
+agenttx-y += src/core/occ.o
 
 # ---------------------------------------------------------------------
 # Provider selection, PER PROVIDER.
