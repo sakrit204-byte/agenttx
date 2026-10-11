@@ -686,6 +686,20 @@ fi
 # root we cannot run there (Claude Code refuses
 # --dangerously-skip-permissions as root, deliberately), so we fall back to
 # the sandbox user and say plainly what will not work.
+# The shared-resource registry, for any turn that might claim one.
+#
+# It used to be created only by the swarm orchestrator, so a single-agent
+# turn calling `claim` was told there was no registry -- a tool offered in
+# every schema that could only ever work in one mode. Contention is not a
+# swarm-only idea either: two separate tasks running against the same
+# folder are exactly as able to collide.
+#
+# Sticky and world-writable like /tmp: agents may create their own lock
+# files and not remove each other's. NOT under /run/agenttx, which is 0700
+# root and therefore untraversable by the agent.
+mkdir -p /run/agenttx-claims 2>/dev/null || true
+chmod 1777 /run/agenttx-claims 2>/dev/null || true
+
 if [ -d "$LOWER" ]; then PRE=1; else PRE=0; mkdir -p "$LOWER"; fi
 OWNER=$(stat -c %%U "$LOWER" 2>/dev/null || echo root)
 if [ "$OWNER" != root ] && id -u "$OWNER" >/dev/null 2>&1; then
@@ -826,6 +840,20 @@ fi
 # root we cannot run there (Claude Code refuses
 # --dangerously-skip-permissions as root, deliberately), so we fall back to
 # the sandbox user and say plainly what will not work.
+# The shared-resource registry, for any turn that might claim one.
+#
+# It used to be created only by the swarm orchestrator, so a single-agent
+# turn calling `claim` was told there was no registry -- a tool offered in
+# every schema that could only ever work in one mode. Contention is not a
+# swarm-only idea either: two separate tasks running against the same
+# folder are exactly as able to collide.
+#
+# Sticky and world-writable like /tmp: agents may create their own lock
+# files and not remove each other's. NOT under /run/agenttx, which is 0700
+# root and therefore untraversable by the agent.
+mkdir -p /run/agenttx-claims 2>/dev/null || true
+chmod 1777 /run/agenttx-claims 2>/dev/null || true
+
 if [ -d "$LOWER" ]; then PRE=1; else PRE=0; mkdir -p "$LOWER"; fi
 OWNER=$(stat -c %%U "$LOWER" 2>/dev/null || echo root)
 if [ "$OWNER" != root ] && id -u "$OWNER" >/dev/null 2>&1; then
