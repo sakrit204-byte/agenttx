@@ -58,6 +58,7 @@ it refers to, so the destination is recoverable without guessing.
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import re
 import sys
@@ -154,7 +155,15 @@ def main(argv=None) -> int:
 
     n_lines = n_parsed = n_stitched = n_signal = 0
     pending_unfin: dict[int, str] = {}
-    with open(a.strace, encoding="utf-8", errors="replace") as fh:
+    # Traces are archived compressed, because a raw one is tens of
+    # megabytes. Reading a .gz with plain open() yields binary that
+    # matches no line pattern, and the tool then reports "no outbound
+    # socket operations found" -- which reads as "this agent made no
+    # network calls" rather than "I could not read this file". That is
+    # the worst shape a failure can take in a measurement tool, and it
+    # made the published figure unreproducible from the archive.
+    opener = gzip.open if a.strace.endswith(".gz") else open
+    with opener(a.strace, "rt", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             n_lines += 1
             line = line.rstrip("\n")
