@@ -73,7 +73,7 @@ DEFAULT_API_KEY = os.environ.get("AGENTTX_API_KEY", "")
 
 # Where the free shim listens, as seen FROM THE GUEST. Under QEMU user
 # networking the host is 10.0.2.2.
-FREE_BASE_URL = os.environ.get("AGENTTX_FREE_URL", "http://10.0.2.2:11434/v1")
+FREE_BASE_URL = os.environ.get("AGENTTX_FREE_URL", "http://10.0.2.2:11435/v1")
 FREE_MODEL = os.environ.get("AGENTTX_FREE_MODEL",
                             "google/gemma-4-31b-it:free")
 

@@ -92,7 +92,7 @@ def cmd_up(a):
     # defers the agent's own model call and the turn dies with a
     # connection timeout -- see the comment in src/bpf/loader.c.
     G.run("pgrep -x txload >/dev/null || "
-          "(setsid /usr/local/bin/txload --pin --infra-port 11434 "
+          "(setsid /usr/local/bin/txload --pin --infra-port 11434 --infra-port 11435 "
           ">/var/log/txload.log 2>&1 &)", timeout=60)
     time.sleep(2)
     cmd_status(a)
@@ -536,7 +536,7 @@ def cmd_test(a):
               timeout=900)[1])
 
     if was_running:
-        G.run("setsid /usr/local/bin/txload --pin --infra-port 11434 "
+        G.run("setsid /usr/local/bin/txload --pin --infra-port 11434 --infra-port 11435 "
               ">/var/log/txload.log 2>&1 &", timeout=60)
         say("%s(BPF loader restarted)%s" % (C_DIM, C_OFF))
 

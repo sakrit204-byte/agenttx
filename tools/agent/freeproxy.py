@@ -47,7 +47,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 UPSTREAM = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "google/gemma-4-31b-it:free"
 
-STATE = {"key": "", "model": DEFAULT_MODEL, "calls": 0, "refused": 0}
+# A free tier is a shared pool, and a shared pool runs out. Both Gemma
+# free variants answered 429 "temporarily rate-limited upstream" while
+# five other zero cost models answered immediately. A harness that dies
+# because one pool is busy is not usable, so we keep an ordered list and
+# walk it. EVERY entry is price-verified at startup, so falling back can
+# never fall back onto a bill.
+FALLBACKS = [
+    "poolside/laguna-s-2.1:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3.5-lightning:free",
+    "cohere/north-mini-code:free",
+]
+
+STATE = {"key": "", "model": DEFAULT_MODEL, "models": [],
+         "calls": 0, "refused": 0, "fellback": 0}
 
 
 def price_of(model: str, key: str):
@@ -119,38 +133,56 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"error": "body is not JSON"})
             return
 
-        # The guard. A caller asking for anything but the verified free
-        # model is refused HERE, before any byte leaves the machine.
+        # The guard. A caller asking for a model outside the verified
+        # free list is refused HERE, before any byte leaves the machine.
         asked = payload.get("model") or STATE["model"]
-        if asked != STATE["model"]:
+        if asked not in STATE["models"]:
             STATE["refused"] += 1
-            print("freeproxy: REFUSED a request for %r; only %r is allowed"
-                  % (asked, STATE["model"]), flush=True)
+            print("freeproxy: REFUSED a request for %r; allowed: %s"
+                  % (asked, ", ".join(STATE["models"])), flush=True)
             self._send(403, {"error": {
-                "message": "freeproxy allows only %s" % STATE["model"],
+                "message": "freeproxy allows only these zero cost models: %s"
+                           % ", ".join(STATE["models"]),
                 "type": "model_not_allowed"}})
             return
-        payload["model"] = STATE["model"]
 
-        req = urllib.request.Request(
-            UPSTREAM + "/chat/completions",
-            data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json",
-                     "Authorization": "Bearer " + STATE["key"],
-                     # OpenRouter asks callers to identify themselves.
-                     "HTTP-Referer": "https://github.com/agenttx",
-                     "X-Title": "AgentTx"})
-        try:
-            with urllib.request.urlopen(req, timeout=300) as r:
-                out = json.loads(r.read().decode())
-            STATE["calls"] += 1
-            self._send(200, out)
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode()[:400]
-            print("freeproxy: upstream %d: %s" % (e.code, detail), flush=True)
-            self._send(e.code, {"error": {"message": detail}})
-        except Exception as e:                    # noqa: BLE001
-            self._send(502, {"error": {"message": str(e)}})
+        # Try the asked-for model, then the rest of the verified list.
+        order = [asked] + [m for m in STATE["models"] if m != asked]
+        last = None
+        for i, model in enumerate(order):
+            payload["model"] = model
+            req = urllib.request.Request(
+                UPSTREAM + "/chat/completions",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + STATE["key"],
+                         # OpenRouter asks callers to identify themselves.
+                         "HTTP-Referer": "https://github.com/agenttx",
+                         "X-Title": "AgentTx"})
+            try:
+                with urllib.request.urlopen(req, timeout=300) as r:
+                    out = json.loads(r.read().decode())
+                STATE["calls"] += 1
+                if i:
+                    STATE["fellback"] += 1
+                    print("freeproxy: %s was unavailable; answered with %s"
+                          % (asked, model), flush=True)
+                self._send(200, out)
+                return
+            except urllib.error.HTTPError as e:
+                last = (e.code, e.read().decode()[:300])
+                # A busy shared pool is the case worth walking past. A
+                # 400 or 404 is our own mistake and retrying elsewhere
+                # would only hide it.
+                if e.code not in (429, 502, 503):
+                    break
+            except Exception as e:                # noqa: BLE001
+                last = (502, str(e))
+
+        code, detail = last or (502, "no upstream answered")
+        print("freeproxy: every free model failed; last %s: %s"
+              % (code, detail), flush=True)
+        self._send(code, {"error": {"message": detail}})
 
 
 def main():
@@ -158,7 +190,13 @@ def main():
         description="free-tier-only local shim to OpenRouter")
     ap.add_argument("--model", default=os.environ.get(
         "AGENTTX_FREE_MODEL", DEFAULT_MODEL))
-    ap.add_argument("--port", type=int, default=11434)
+    # 11435, not 11434: Ollama owns 11434 and the point of the
+    # provider split is that both brains can be up at once, so the same
+    # task can be run against each without reconfiguring anything.
+    ap.add_argument("--port", type=int, default=11435)
+    ap.add_argument("--fallback", default=",".join(FALLBACKS),
+                    help="comma separated zero cost models to try when the "
+                         "primary pool is busy; each is price-verified too")
     ap.add_argument("--host", default="0.0.0.0",
                     help="0.0.0.0 so the guest reaches it at 10.0.2.2")
     ap.add_argument("--key-file", default=os.path.expanduser(
@@ -176,8 +214,10 @@ def main():
             "           add a payment method if you want a hard zero spend\n"
             "           guarantee." % a.key_file)
 
-    STATE["key"], STATE["model"] = key, a.model
-    verify_free(a.model, key)
+    wanted = [a.model] + [m for m in (a.fallback or "").split(",") if m]
+    for m in wanted:
+        verify_free(m, key)          # refuses to start on anything priced
+    STATE["key"], STATE["model"], STATE["models"] = key, a.model, wanted
 
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     print("freeproxy: listening on %s:%d -> %s"
