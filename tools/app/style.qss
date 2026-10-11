@@ -198,3 +198,17 @@ QHeaderView::section {
 }
 #VerBtn:hover { background: #1e2c40; color: #e6edf3; border-color: #3a4d68; }
 #VerBtn:disabled { background: #0e141c; color: #3a4252; border-color: #19212c; }
+
+/* A shell command the agent ran. Deliberately louder than the rest of a
+   tool card: the reader must not be able to skim past the fact that the
+   tree was changed by a command line rather than by an edit. */
+#ToolCmd {
+    color: #7ee787;
+    background: #06090d;
+    border: 1px solid #1c2531;
+    border-left: 2px solid #3fb950;
+    border-radius: 5px;
+    padding: 6px 9px;
+    font-family: 'JetBrains Mono', 'DejaVu Sans Mono', monospace;
+    font-size: 11.5px;
+}

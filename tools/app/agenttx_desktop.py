@@ -100,11 +100,26 @@ def lab(text, obj=None, wrap=False, size=None, bold=False, selectable=True):
     return w
 
 
+def rgba(hexc, a):
+    """A translucent colour Qt will actually parse.
+
+    Qt stylesheets read an 8 digit hex colour as #AARRGGBB, not the
+    #RRGGBBAA that CSS habits suggest. Appending "22" to #3fb950 for a
+    faint green therefore asked for alpha 3f, red b9, green 50, blue 22,
+    which is a muddy orange. Every pill and chip in this app was tinted
+    that way. rgba() has no such ambiguity.
+    """
+    h = hexc.lstrip("#")
+    return "rgba(%d, %d, %d, %.3f)" % (
+        int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16), a)
+
+
 def pill(text, colour):
     p = QLabel(text)
     p.setObjectName("Pill")
     p.setStyleSheet(
-        f"background:{colour}22; color:{colour}; border:1px solid {colour}66;")
+        "background:%s; color:%s; border:1px solid %s;"
+        % (rgba(colour, 0.13), colour, rgba(colour, 0.40)))
     p.setAlignment(Qt.AlignmentFlag.AlignCenter)
     p.setFixedHeight(20)
     return p
@@ -394,9 +409,13 @@ class FileChip(QFrame):
         super().__init__()
         self.setObjectName("Chip")
         colour, word = self.KIND.get(d.get("kind"), ("#8b9aad", d.get("kind")))
+        # Qt reads an 8 digit hex colour as #AARRGGBB, not #RRGGBBAA, so
+        # "#d2992218" for a modified file came out a dark red and every
+        # edited file looked deleted. rgba() has no such ambiguity.
         self.setStyleSheet(
-            "#Chip { background: %s18; border: 1px solid %s55;"
-            " border-radius: 6px; }" % (colour, colour))
+            "#Chip { background: %s; border: 1px solid %s;"
+            " border-radius: 6px; }"
+            % (rgba(colour, 0.09), rgba(colour, 0.33)))
         h = QHBoxLayout(self)
         h.setContentsMargins(8, 4, 8, 4)
         h.setSpacing(7)
@@ -436,7 +455,7 @@ class TxCard(QFrame):
     hovered = pyqtSignal(str)
 
     def __init__(self, tx, agent, state, diff, lower,
-                 on_version=None, on_export=None):
+                 on_version=None, on_export=None, cmds=None):
         super().__init__()
         self.tx = str(tx)
         self.setObjectName("TxCard")
@@ -470,6 +489,31 @@ class TxCard(QFrame):
                                 selectable=False))
         else:
             v.addWidget(lab("nothing changed yet", "Muted", selectable=False))
+
+        # How the change was made, not just what changed. A layer whose
+        # files were rewritten by one `sed -i` across a tree reads very
+        # differently from one built by thirty deliberate edits, and the
+        # file chips above cannot tell those apart.
+        if cmds:
+            v.addWidget(lab("ran %d shell command%s:"
+                            % (len(cmds), "" if len(cmds) == 1 else "s"),
+                            "Muted", selectable=False))
+            for c in cmds[:4]:
+                one = lab("$ " + (c if len(c) <= 90 else c[:89] + "\u2026"),
+                          selectable=False)
+                one.setWordWrap(True)
+                one.setStyleSheet(
+                    "color: #7ee787; font-size: 10.5px;"
+                    " background: #06090d; border: 1px solid #1c2531;"
+                    " border-left: 2px solid #3fb950; border-radius: 4px;"
+                    " padding: 3px 6px;"
+                    " font-family: 'JetBrains Mono','DejaVu Sans Mono',"
+                    "monospace;")
+                v.addWidget(one)
+            if len(cmds) > 4:
+                v.addWidget(lab("+%d more command%s" % (len(cmds) - 4,
+                                "" if len(cmds) - 4 == 1 else "s"),
+                                "Muted", selectable=False))
 
         if on_export and diff:
             row = QHBoxLayout()
@@ -640,7 +684,7 @@ class LayerStack(QWidget):
             if it.widget():
                 it.widget().deleteLater()
 
-    def update(self, snap, diffs, agents):
+    def update(self, snap, diffs, agents, cmds=None):
         live = snap.get("txlive") or []
         sig = (tuple(sorted(t["tx"] for t in live)),
                tuple(sorted((k, len(v or [])) for k, v in diffs.items())))
@@ -667,6 +711,7 @@ class LayerStack(QWidget):
                 tx = t["tx"]
                 c = TxCard(tx, agents.get(str(tx)), t.get("state"),
                            diffs.get(str(tx)), lowers.get(tx),
+                           cmds=(cmds or {}).get(str(tx)),
                            on_version=self.show_file.emit,
                            on_export=self.export.emit)
                 c.clicked.connect(self.show_tx.emit)
@@ -1176,10 +1221,10 @@ class HoodView(QWidget):
             "your folder yet." % (tx, (" · " + who) if who else ""))
         self.diffview.show_diff(tx, self._diffs.get(str(tx)))
 
-    def set_layers(self, snap, diffs, agents):
+    def set_layers(self, snap, diffs, agents, cmds=None):
         self._diffs = diffs
         self._agents = agents
-        self.stack_view.update(snap, diffs, agents)
+        self.stack_view.update(snap, diffs, agents, cmds)
         if self._open_tx:
             self.diffview.show_diff(self._open_tx,
                                     diffs.get(str(self._open_tx)))
@@ -1379,6 +1424,17 @@ class ToolCard(QFrame):
         head.addWidget(self.state)
         v.addLayout(head)
 
+        # A shell command is not a detail to be folded away. If the agent
+        # changed the tree by running sed over it, the reader has to see
+        # the sed, not just the diff it produced. This line sits above the
+        # twisty and is never hidden.
+        self.cmd = QLabel("")
+        self.cmd.setObjectName("ToolCmd")
+        self.cmd.setWordWrap(True)
+        self.cmd.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.cmd.hide()
+        v.addWidget(self.cmd)
+
         self.body = QPlainTextEdit()
         self.body.setReadOnly(True)
         self.body.setObjectName("ToolBody")
@@ -1386,6 +1442,14 @@ class ToolCard(QFrame):
         self.body.hide()
         v.addWidget(self.body)
         self._text = ""
+
+    def set_command(self, command: str):
+        """Show the shell command itself, always, in full."""
+        c = (command or "").strip()
+        if not c:
+            return
+        self.cmd.setText("$ " + c)
+        self.cmd.show()
 
     def _toggled(self, on):
         self.toggle.setText("▾" if on else "▸")
@@ -1401,7 +1465,8 @@ class ToolCard(QFrame):
         self.state.setText("failed" if is_error else "done")
         colour = C["deleted"] if is_error else C["created"]
         self.state.setStyleSheet(
-            f"background:{colour}22;color:{colour};border:1px solid {colour}66;")
+            "background:%s;color:%s;border:1px solid %s;"
+            % (rgba(colour, 0.13), colour, rgba(colour, 0.40)))
         if is_error:
             # A failure is never the boring case.
             self.toggle.setChecked(True)
@@ -1746,10 +1811,16 @@ class ChatView(QWidget):
                         self._last_bubble = None
                 elif c.get("type") == "tool_use":
                     who = e.get("agent")
-                    card_ = ToolCard((("%s · " % who) if who else "")
-                                     + (c.get("name") or "tool"),
-                                     self._summarise(c.get("name"),
-                                                     c.get("input") or {}))
+                    tname = c.get("name") or "tool"
+                    targs = c.get("input") or {}
+                    # Name it for what it is. "run" reads like an internal
+                    # detail; "shell" tells the reader a command line ran.
+                    label = "shell" if tname == "run" else tname
+                    card_ = ToolCard((("%s · " % who) if who else "") + label,
+                                     "" if tname == "run"
+                                     else self._summarise(tname, targs))
+                    if tname == "run":
+                        card_.set_command(str(targs.get("command") or ""))
                     card_.set_input(json.dumps(c.get("input") or {},
                                                indent=2)[:8000])
                     self._tools[c.get("id")] = card_
@@ -2002,6 +2073,9 @@ class Main(QMainWindow):
         self._want_new = False          # user asked for an empty chat
         self._live_tx = None            # tx ids the kernel actually has
         self._agent_of = {}             # tx -> agent name, from swarm events
+        self._cmds_of = {}              # tx -> shell commands run in it
+        self._cmds_pending = {}         # agent -> commands, until its tx lands
+        self._turn_tx = ""              # the single-agent turn's transaction
         self._last_sig = None
         self._busy = False
 
@@ -2317,7 +2391,8 @@ class Main(QMainWindow):
             self.hoodview.update_live(snap)
             live = [t["tx"] for t in (snap.get("txlive") or [])]
             if not live:
-                self.hoodview.set_layers(snap, {}, self._agent_of)
+                self.hoodview.set_layers(snap, {}, self._agent_of,
+                                         self._cmds_of)
                 return
 
             # One round trip for every open layer's diff. Bounded by the
@@ -2327,7 +2402,8 @@ class Main(QMainWindow):
             def gotdiffs(res):
                 if isinstance(res, Exception):
                     return
-                self.hoodview.set_layers(snap, res, self._agent_of)
+                self.hoodview.set_layers(snap, res, self._agent_of,
+                                         self._cmds_of)
                 self.hoodview.set_layer_choices(snap.get("txlive") or [],
                                                 self._agent_of)
 
@@ -2344,11 +2420,13 @@ class Main(QMainWindow):
     def on_tick(self, threads, sessions, alive, err):
         if alive:
             self.linkpill.setStyleSheet(
-                "background:#3fb95022;color:#3fb950;border:1px solid #3fb95066;")
+                "background:%s;color:#3fb950;border:1px solid %s;"
+                % (rgba("#3fb950", 0.13), rgba("#3fb950", 0.40)))
             self.linkpill.setText("sandbox connected")
         else:
             self.linkpill.setStyleSheet(
-                "background:#f8514922;color:#f85149;border:1px solid #f8514966;")
+                "background:%s;color:#f85149;border:1px solid %s;"
+                % (rgba("#f85149", 0.13), rgba("#f85149", 0.40)))
             self.linkpill.setText("sandbox offline")
 
         self.threads = threads
@@ -2412,9 +2490,38 @@ class Main(QMainWindow):
                 # A swarm names its agents as they finish; the layer
                 # picture is much easier to read with "add-license" on a
                 # card than "transaction 23".
+                # The layer picture shows WHAT changed. Without the
+                # commands it hides HOW: a tree rewritten by one sed looks
+                # the same as thirty considered edits. Collect them here,
+                # where the events already pass through.
                 for e in evs:
-                    if e.get("type") == "swarm_agent_done" and e.get("tx"):
-                        self._agent_of[str(e["tx"])] = e.get("agent") or ""
+                    et = e.get("type")
+                    if et == "swarm_agent_done" and e.get("tx"):
+                        tx = str(e["tx"])
+                        who = e.get("agent") or ""
+                        self._agent_of[tx] = who
+                        pend = self._cmds_pending.pop(who, [])
+                        if pend:
+                            self._cmds_of.setdefault(tx, []).extend(pend)
+                    elif et == "tx_turn_start" and e.get("tx"):
+                        self._turn_tx = str(e["tx"])
+                    elif et == "assistant":
+                        for c in (e.get("message", {}) or {}
+                                  ).get("content", []) or []:
+                            if (c.get("type") != "tool_use"
+                                    or c.get("name") != "run"):
+                                continue
+                            cmd = str((c.get("input") or {}
+                                       ).get("command") or "").strip()
+                            if not cmd:
+                                continue
+                            who = e.get("agent") or ""
+                            if who:
+                                self._cmds_pending.setdefault(
+                                    who, []).append(cmd)
+                            elif self._turn_tx:
+                                self._cmds_of.setdefault(
+                                    self._turn_tx, []).append(cmd)
                 self.chat.append_events(evs)
             run_async(self, THREADS.events, tid, since, then=got)
 
