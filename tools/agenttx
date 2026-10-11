@@ -198,7 +198,10 @@ def _run(a, shell):
     if shell:
         _rc, out, _e = T.start_shell(thread, a.folder, text, text[:60])
     else:
-        mode = "swarm" if a.agents > 1 else ("claude" if a.claude else "local")
+        mode = ("swarm" if a.agents > 1
+                else "claude" if a.claude
+                else "free" if getattr(a, "free", False)
+                else "local")
         _rc, out, _e = T.start_turn(thread, a.folder, text, text[:60],
                                     str(uuid.uuid4()), "agent", mode,
                                     a.agents, a.model)
@@ -452,6 +455,44 @@ def cmd_demo(a):
     say(out or err)
 
 
+def cmd_free(a):
+    """Start the free-tier shim and point the agent at it."""
+    import subprocess as sp
+    root = os.path.dirname(os.path.abspath(__file__))
+    proxy = os.path.join(root, "agent", "freeproxy.py")
+    keyfile = os.path.expanduser("~/.agenttx-openrouter-key")
+
+    if a.stop:
+        sp.run(["pkill", "-f", "freeproxy.py"], check=False)
+        print("free model shim stopped")
+        return 0
+
+    if not os.environ.get("OPENROUTER_API_KEY") and not os.path.exists(keyfile):
+        print("No API key yet. Three steps, all on your side:\n")
+        print("  1. Make an account at https://openrouter.ai")
+        print("     Do NOT add a payment method. An account with no card")
+        print("     on file cannot be charged, whatever else goes wrong.")
+        print("  2. Create a key at https://openrouter.ai/keys")
+        print("  3. Save it:")
+        print("       install -m600 /dev/null %s" % keyfile)
+        print("       printf '%%s' 'sk-or-v1-...' > %s" % keyfile)
+        print("\nThen run: agenttx free")
+        return 1
+
+    log = "/tmp/agenttx-freeproxy.log"
+    with open(log, "wb") as fh:
+        sp.Popen([sys.executable, proxy, "--model", a.model],
+                 stdout=fh, stderr=sp.STDOUT, start_new_session=True)
+    time.sleep(3)
+    out = open(log).read()
+    print(out.strip() or "(no output yet)")
+    if "verified free" not in out:
+        print("\nThe shim did not confirm the model is free; not switching.")
+        return 1
+    print("\nNow run tasks with:  agenttx task --free \"...\"")
+    return 0
+
+
 def cmd_login(a):
     need_guest()
     say("Run this, then follow the URL it prints:\n")
@@ -518,6 +559,9 @@ def main():
     add("app", cmd_app, "open the desktop app")
     add("layers", cmd_layers, "live transactions and the wait-for graph")
     add("login", cmd_login, "sign the sandbox agent in")
+    q = add("free", cmd_free, "use a free remote model instead of the local one")
+    q.add_argument("--model", default="google/gemma-4-31b-it:free")
+    q.add_argument("--stop", action="store_true", help="stop the shim")
     add("test", cmd_test, "run the test suites")
 
     for name, fn, h in (("task", cmd_task, "give the agent a task"),
@@ -532,6 +576,8 @@ def main():
                            help="run N agents at once, one transaction each")
             q.add_argument("--claude", action="store_true",
                            help="use Claude Code on your subscription")
+            q.add_argument("--free", action="store_true",
+                           help="use the free remote model (agenttx free)")
             q.add_argument("--model", "-m", help="override the local model")
 
     q = add("try", cmd_try, "run something inside a pending transaction")

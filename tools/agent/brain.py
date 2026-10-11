@@ -61,9 +61,21 @@ DEFAULT_MODEL = os.environ.get("AGENTTX_MODEL", "qwen2.5:7b")
 # same measurement, across four models of different capability". The
 # transaction machinery does not care which brain is answering and this
 # keeps it that way.
+# "free"    a local freeproxy shim (tools/agent/freeproxy.py) in front of
+#           a provider's zero cost tier. It speaks the OpenAI dialect, so
+#           it is the openai path with a different default base URL and
+#           no key: the key lives in the proxy, on the host, where an
+#           agent inside a transaction cannot reach it. See freeproxy.py
+#           for why the model is not called directly.
 DEFAULT_PROVIDER = os.environ.get("AGENTTX_PROVIDER", "ollama").lower()
 DEFAULT_BASE_URL = os.environ.get("AGENTTX_BASE_URL", "")
 DEFAULT_API_KEY = os.environ.get("AGENTTX_API_KEY", "")
+
+# Where the free shim listens, as seen FROM THE GUEST. Under QEMU user
+# networking the host is 10.0.2.2.
+FREE_BASE_URL = os.environ.get("AGENTTX_FREE_URL", "http://10.0.2.2:11434/v1")
+FREE_MODEL = os.environ.get("AGENTTX_FREE_MODEL",
+                            "google/gemma-4-31b-it:free")
 
 
 class BrainError(RuntimeError):
@@ -75,7 +87,16 @@ class Brain:
                  timeout: int = 300, provider: str = DEFAULT_PROVIDER,
                  api_key: str = DEFAULT_API_KEY):
         self.provider = (provider or "ollama").lower()
-        base = DEFAULT_BASE_URL if self.provider == "openai" else host
+        if self.provider == "free":
+            # Same wire format as openai; only the endpoint and the
+            # absence of a key differ.
+            self.provider = "openai"
+            base = DEFAULT_BASE_URL or FREE_BASE_URL
+            if model == DEFAULT_MODEL:
+                model = FREE_MODEL
+            api_key = api_key or "unused-the-proxy-holds-it"
+        else:
+            base = DEFAULT_BASE_URL if self.provider == "openai" else host
         self.host = (base or host).rstrip("/")
         self.model = model
         self.timeout = timeout

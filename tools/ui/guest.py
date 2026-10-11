@@ -781,6 +781,14 @@ cat /run/agenttx/last-start.log
             return ('/usr/bin/env python3 %s/swarm.py "$TD" "$TURN" '
                     '--lower "$LOWER" --agents %d --runas "$RUNAS"%s'
                     % (self.AGENT_DIR, int(agents), m))
+        if mode == "free":
+            # Same loop, same transaction, different brain. The provider
+            # is chosen by environment so nothing downstream has to know
+            # which model is answering -- which is the whole point of the
+            # provider split in brain.py.
+            return base + ('/usr/bin/env AGENTTX_PROVIDER=free python3 '
+                           '%s/loop.py "$TD" "$TURN"%s'
+                           % (self.AGENT_DIR, m))
         return base + '/usr/bin/env python3 %s/loop.py "$TD" "$TURN"%s' % (
             self.AGENT_DIR, m)
 
