@@ -1472,6 +1472,12 @@ class ToolCard(QFrame):
             self.toggle.setChecked(True)
 
 
+# What the live strip calls the free brain. The full id
+# ("google/gemma-4-31b-it:free") does not fit the strip and the strip is
+# meant to be glanced at, not read.
+FREE_MODEL_SHORT = os.environ.get("AGENTTX_FREE_SHORT", "gemma-4-31b free")
+
+
 class Bubble(QFrame):
     """One message. `who` is 'you', 'agent', or 'problem'."""
 
@@ -1989,6 +1995,8 @@ class ChatView(QWidget):
             return str(inp["description"])[:120]
         return ""
 
+    _brain_label = ""
+
     def update_live(self, snap):
         """Numbers that move while the agents work."""
         if not snap.get("reachable"):
@@ -2001,7 +2009,17 @@ class ChatView(QWidget):
         self.live["files"].setText(str(snap.get("upper_files", st.get("n_written", 0))))
         self.live["wfg"].setText(str(snap.get("wfg_edges", 0)))
         self.live["dead"].setText(str(snap.get("deadlocks", 0)))
-        self.live["model"].setText(snap.get("brain") or "—")
+        # The snapshot asks the LOCAL model what it is called, which was
+        # the whole story when there was only one brain. With a selector
+        # in the header it became a lie: the strip read "qwen2.5:7b"
+        # while the header said Free remote and a hosted model was
+        # answering. Name the brain that will actually take the turn.
+        self.live["model"].setText(
+            self._brain_label or snap.get("brain") or "—")
+
+    def set_brain_label(self, text: str) -> None:
+        self._brain_label = text or ""
+        self.live["model"].setText(self._brain_label or "—")
 
     def set_review(self, tx, status, diff, swarm=False):
         """
@@ -2187,6 +2205,9 @@ class Main(QMainWindow):
         split.setStretchFactor(1, 1)
         rv.addWidget(split, 1)
 
+        # Right from the first paint, not only after the selector moves.
+        self._sync_brain_label()
+
         self.poll = Poller()
         self.poll.tick.connect(self.on_tick)
         self.poll.start()
@@ -2290,6 +2311,7 @@ class Main(QMainWindow):
         listening.
         """
         brain = self.brain.currentData() or "local"
+        self._sync_brain_label()
 
         def done(res):
             ok, why = res if isinstance(res, tuple) else (False, str(res))
@@ -2299,6 +2321,15 @@ class Main(QMainWindow):
                 self.chat.add(Bubble("notice", "Heads up: " + why))
 
         run_async(self, GUEST.brain_ready, brain, then=done)
+
+    def _sync_brain_label(self) -> None:
+        """Tell the live strip which brain is going to answer."""
+        brain = self.brain.currentData() or "local"
+        label = {"free": FREE_MODEL_SHORT, "claude": "claude code"}.get(brain)
+        for strip in (getattr(self, "chat", None),
+                      getattr(self, "hoodview", None)):
+            if strip is not None and hasattr(strip, "set_brain_label"):
+                strip.set_brain_label(label or "")
 
     def decide(self, tx, what):
         run_async(self, GUEST.session_decide, tx, what)
