@@ -2124,6 +2124,24 @@ class Main(QMainWindow):
             "you keep anything.")
         top.addWidget(self.mode)
 
+        # Which brain answers. Separate from the agent count on purpose:
+        # three agents on the free remote model is a reasonable thing to
+        # want, and when the two were one setting it could not be said.
+        self.brain = QComboBox()
+        self.brain.setObjectName("Mode")
+        self.brain.addItem("Local 7B", "local")
+        self.brain.addItem("Free remote", "free")
+        self.brain.addItem("Claude", "claude")
+        self.brain.setToolTip(
+            "Local 7B    the model on this machine. No account, no limit.\n"
+            "Free remote a hosted model on a zero cost tier, through a\n"
+            "            proxy that refuses anything the provider prices\n"
+            "            above zero. Shared pools are rate limited, so a\n"
+            "            busy one falls through to the next free model.\n"
+            "Claude      your Claude Code subscription.")
+        self.brain.currentIndexChanged.connect(self._brain_changed)
+        top.addWidget(self.brain)
+
         self.linkpill = pill("connecting…", "#8b9aad")
         self.linkpill.setMinimumWidth(150)
         top.addWidget(self.linkpill)
@@ -2254,8 +2272,33 @@ class Main(QMainWindow):
                       then=done)
             return
         mode, n = self.mode.currentData() or ("local", 1)
+        brain = self.brain.currentData() or "local"
+        # Claude is still selected by mode, because it runs a different
+        # agent binary rather than the same loop with another endpoint.
+        if brain == "claude" and mode != "swarm":
+            mode, brain = "claude", "local"
         run_async(self, THREADS.start_turn, tid, lower, payload, title,
-                  sid or str(uuid.uuid4()), "agent", mode, n, then=done)
+                  sid or str(uuid.uuid4()), "agent", mode, n, None, brain,
+                  then=done)
+
+    def _brain_changed(self):
+        """Say now whether the chosen brain is reachable, not at task time.
+
+        Picking a brain that is not running used to fail several seconds
+        into a turn, inside a transaction, as a model error -- which
+        reads like the agent went wrong rather than like nothing was
+        listening.
+        """
+        brain = self.brain.currentData() or "local"
+
+        def done(res):
+            ok, why = res if isinstance(res, tuple) else (False, str(res))
+            self.brain.setStyleSheet(
+                "" if ok else "QComboBox { border: 1px solid #d29922; }")
+            if not ok:
+                self.chat.add(Bubble("notice", "Heads up: " + why))
+
+        run_async(self, GUEST.brain_ready, brain, then=done)
 
     def decide(self, tx, what):
         run_async(self, GUEST.session_decide, tx, what)

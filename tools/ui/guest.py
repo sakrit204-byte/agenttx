@@ -61,6 +61,38 @@ class GuestLink:
             self.last_error = "guest did not answer in time"
             return 124, "", self.last_error
 
+    def brain_ready(self, brain: str) -> tuple[bool, str]:
+        """Can an agent in the sandbox actually reach this brain?
+
+        Asked FROM THE GUEST, because that is who has to reach it. The
+        host being able to curl the proxy says nothing about whether the
+        exemption and the route are in place.
+        """
+        if brain == "free":
+            rc, out, _e = self.run(
+                "timeout 8 curl -s -o /dev/null -w '%{http_code}' "
+                "http://10.0.2.2:11435/v1/models", timeout=25)
+            if (out or "").strip() == "200":
+                return True, "free remote model reachable"
+            return False, ("the free model shim is not answering on "
+                           "10.0.2.2:11435 -- start it on the host with "
+                           "'agenttx free'")
+        if brain == "claude":
+            rc, out, _e = self.run(
+                "test -f /home/agent/.claude/.credentials.json "
+                "&& echo yes || echo no", timeout=25)
+            if (out or "").strip() == "yes":
+                return True, "Claude is signed in"
+            return False, ("the sandbox agent is not signed in to Claude -- "
+                           "run 'agenttx login'")
+        rc, out, _e = self.run(
+            "timeout 8 curl -s -o /dev/null -w '%{http_code}' "
+            "http://10.0.2.2:11434/api/tags", timeout=25)
+        if (out or "").strip() == "200":
+            return True, "local model reachable"
+        return False, ("no local model on 10.0.2.2:11434 -- is Ollama "
+                       "running on the host?")
+
     # --- cheap liveness, cached for a second --------------------------
     def alive(self) -> bool:
         now = time.time()
@@ -766,10 +798,19 @@ cat /run/agenttx/last-start.log
     AGENT_DIR = "/usr/local/lib/agenttx/agent"
 
     def _runner(self, mode: str, td_q: str, session_uuid: str,
-                lower_q: str, agents: int, model: str | None) -> str:
+                lower_q: str, agents: int, model: str | None,
+                brain: str = "local") -> str:
         base = ('/usr/local/bin/txctl session --lower "$LOWER" '
                 '--as "$RUNAS" -- ')
         m = (" --model %s" % shlex.quote(model)) if model else ""
+        # WHICH brain and HOW MANY agents are independent choices, and
+        # they used to be tangled in one string: "free" meant one agent
+        # on the remote model and there was no way to say three. The
+        # brain travels by environment, so a swarm picks it up for every
+        # agent it starts without anything else having to know.
+        if mode == "free":              # the old spelling, still accepted
+            mode, brain = "local", "free"
+        env = "AGENTTX_PROVIDER=free " if brain == "free" else ""
         if mode == "claude":
             return base + '/usr/local/bin/tx-agent.py "$TD" "$TURN" %s' % (
                 shlex.quote(session_uuid))
@@ -778,25 +819,17 @@ cat /run/agenttx/last-start.log
             # writes no files, it starts the agents that do. Wrapping it in
             # one would add an empty transaction to every swarm run and
             # make the agent count in the UI wrong by one.
-            return ('/usr/bin/env python3 %s/swarm.py "$TD" "$TURN" '
+            return ('/usr/bin/env %spython3 %s/swarm.py "$TD" "$TURN" '
                     '--lower "$LOWER" --agents %d --runas "$RUNAS"%s'
-                    % (self.AGENT_DIR, int(agents), m))
-        if mode == "free":
-            # Same loop, same transaction, different brain. The provider
-            # is chosen by environment so nothing downstream has to know
-            # which model is answering -- which is the whole point of the
-            # provider split in brain.py.
-            return base + ('/usr/bin/env AGENTTX_PROVIDER=free python3 '
-                           '%s/loop.py "$TD" "$TURN"%s'
-                           % (self.AGENT_DIR, m))
-        return base + '/usr/bin/env python3 %s/loop.py "$TD" "$TURN"%s' % (
-            self.AGENT_DIR, m)
+                    % (env, self.AGENT_DIR, int(agents), m))
+        return base + '/usr/bin/env %spython3 %s/loop.py "$TD" "$TURN"%s' % (
+            env, self.AGENT_DIR, m)
 
     def start_turn(self, thread_id: str, lower: str, prompt: str,
                    title: str, session_uuid: str,
                    as_user: str = "agent", mode: str = "local",
-                   agents: int = 3, model: str | None = None
-                   ) -> tuple[int, str, str]:
+                   agents: int = 3, model: str | None = None,
+                   brain: str = "local") -> tuple[int, str, str]:
         self.g.deploy()
         td = "%s/%s" % (THREADS_DIR, thread_id)
         script = self.START_SH % {
@@ -807,7 +840,7 @@ cat /run/agenttx/last-start.log
             "sid": shlex.quote(session_uuid),
             "prompt": prompt,
             "runner": self._runner(mode, shlex.quote(td), session_uuid,
-                                   shlex.quote(lower), agents, model),
+                                   shlex.quote(lower), agents, model, brain),
         }
         return self.g._run_stdin(script)
 
